@@ -16,5 +16,5 @@ wheels/
 .claude/
 
 merged_data/
-kg_storage
+kg_storage/
 *.json

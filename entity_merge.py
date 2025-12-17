@@ -256,14 +256,15 @@ class EntityDataLoader:
     2. 直接从字典加载（extract_documents_async() 的输出）
     """
 
-    def __init__(self, output_dir: str = "./processed_data"):
+    def __init__(self, output_dir: str = None):
         """
         初始化数据加载器
 
         Args:
-            output_dir: 输出目录
+            output_dir: 输出目录，默认从环境变量读取
         """
-        self.output_dir = output_dir
+        # 默认从环境变量读取，如果没有则使用 "./processed_data"
+        self.output_dir = output_dir or os.getenv("ENTITY_MERGE_PROCESSED_DATA_DIR", "./processed_data")
 
         # 数据存储
         self.entities: List[Dict[str, Any]] = []
@@ -276,10 +277,10 @@ class EntityDataLoader:
         self.merged_data_dir = self.incremental_config["merged_data_dir"]
 
         # 确保输出目录存在
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
 
-        logger.info(f"初始化实体数据加载器，输出目录: {output_dir}")
+        logger.info(f"初始化实体数据加载器，输出目录: {self.output_dir}")
         logger.info(f"增量更新配置: enabled={self.incremental_enabled}, data_dir={self.merged_data_dir}")
 
     def load_from_json(
@@ -3206,9 +3207,10 @@ async def main():
     load_dotenv()
 
     try:
-        # 默认从新架构输出目录加载
-        entities_file = "./new_rag_storage/entities.json"
-        relations_file = "./new_rag_storage/relations.json"
+        # 从环境变量获取输入目录
+        input_dir = os.getenv("ENTITY_MERGE_INPUT_DIR", "./new_rag_storage")
+        entities_file = os.path.join(input_dir, "entities.json")
+        relations_file = os.path.join(input_dir, "relations.json")
 
         # 检查文件是否存在
         if not os.path.exists(entities_file):
@@ -3216,8 +3218,9 @@ async def main():
             logger.info("请先运行 new_test.py 生成数据")
             return
 
-        # 创建数据加载器
-        loader = EntityDataLoader(output_dir="./merged_data")
+        # 创建数据加载器（使用环境变量中的路径）
+        merged_data_dir = os.getenv("ENTITY_MERGE_OUTPUT_DIR", "./merged_data")
+        loader = EntityDataLoader(output_dir=merged_data_dir)
 
         # 从 JSON 文件加载数据
         entities, relations = loader.load_from_json(
