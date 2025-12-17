@@ -1,0 +1,42 @@
+[
+  {
+    "entity_type_dim1": "数学",
+    "entity_type_dim2": "概念",
+    "description": "几何学中的基本图形变换，指平面内图形绕定点按某方向转动角度的运动过程。",
+    "source_id": "chunk-285dea78010ef2e2b5192aa7101bc164",
+    "file_path": "unknown-0",
+    "data_source": "extracted",
+    "is_problem_extracted": false,
+    "entity_id": "旋转<gECLwS>"
+  },
+  {
+    "entity_type_dim1": "数学",
+    "entity_type_dim2": "概念",
+    "description": "图形旋转时所围绕的固定点。",
+    "source_id": "chunk-285dea78010ef2e2b5192aa7101bc164",
+    "file_path": "unknown-0",
+    "data_source": "extracted",
+    "is_problem_extracted": false,
+    "entity_id": "旋转中心<csCfjY>"
+  },
+  {
+    "entity_type_dim1": "数学",
+    "entity_type_dim2": "概念",
+    "description": "图形旋转时转动的角度。",
+    "source_id": "chunk-285dea78010ef2e2b5192aa7101bc164",
+    "file_path": "unknown-0",
+    "data_source": "extracted",
+    "is_problem_extracted": false,
+    "entity_id": "旋转角<ggSRwY>"
+  },
+  {
+    "entity_type_dim1": "数学",
+    "entity_type_dim2": "原理",
+    "description": "用于计算二维平面中点坐标旋转变换的数学矩阵。",
+    "source_id": "chunk-285dea78010ef2e2b5192aa7101bc164",
+    "file_path": "unknown-0",
+    "data_source": "extracted",
+    "is_problem_extracted": false,
+    "entity_id": "旋转矩阵<evuzDW>"
+  }
+]

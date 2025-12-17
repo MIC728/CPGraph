@@ -1,0 +1,10 @@
+{
+  "chunk-285dea78010ef2e2b5192aa7101bc164": {
+    "chunk_id": "chunk-285dea78010ef2e2b5192aa7101bc164",
+    "content": "旋转是几何学中的基本图形变换，指平面内图形绕定点按某方向转动角度的运动过程，该定点称为旋转中心，转动的角度称为旋转角。二维平面是的点旋转可以使用旋转矩阵计算",
+    "tokens": 67,
+    "chunk_order_index": 0,
+    "full_doc_id": "doc-0",
+    "file_path": "unknown-0"
+  }
+}
