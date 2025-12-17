@@ -115,7 +115,7 @@ async def extract_and_extract(input_path: str, mode: str):
             thread_count=int(os.getenv("THREAD_COUNT", "16")),
             max_concurrent_per_thread=int(os.getenv("MAX_CONCURRENT", "8")),
             chunk_token_size=int(os.getenv("CHUNK_SIZE", "1200")),
-            chunk_overlap_token_size=int(os.getenv("CHUNK_OVERLAP", "128")),
+            chunk_overlap_token_size=int(os.getenv("CHUNK_OVERLAP_SIZE", "100")),
             output_dir=os.getenv("EXTRACTOR_OUTPUT_DIR", "./kg_storage"),
             enable_progress_logging=True,
             log_interval=5
@@ -127,7 +127,7 @@ async def extract_and_extract(input_path: str, mode: str):
             thread_count=int(os.getenv("THREAD_COUNT", "16")),
             max_concurrent_per_thread=int(os.getenv("MAX_CONCURRENT", "8")),
             chunk_token_size=10000000000,
-            chunk_overlap_token_size=int(os.getenv("CHUNK_OVERLAP", "128")),
+            chunk_overlap_token_size=int(os.getenv("CHUNK_OVERLAP_SIZE", "100")),
             extraction_mode="problem",
             output_dir=os.getenv("EXTRACTOR_OUTPUT_DIR", "./kg_storage"),
             enable_progress_logging=True,

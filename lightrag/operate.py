@@ -8,8 +8,6 @@ import json_repair
 from typing import Any, AsyncIterator, overload, Literal
 from collections import Counter, defaultdict
 
-from lightrag.timing import timeit_sync, timeit_async, timeit_async_block, print_timing_report
-
 from lightrag.exceptions import PipelineCancelledException
 from lightrag.utils import (
     logger,
@@ -38,7 +36,6 @@ from lightrag.utils import (
     apply_source_ids_limit,
     merge_source_ids,
     make_relation_chunk_key,
-    cosine_similarity,
 )
 from lightrag.base import (
     BaseGraphStorage,
@@ -58,8 +55,6 @@ from lightrag.constants import (
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_KG_CHUNK_PICK_METHOD,
     DEFAULT_ENTITY_TYPES,
-    DEFAULT_ENTITY_TYPES_DIM1,
-    DEFAULT_ENTITY_TYPES_DIM2,
     DEFAULT_SUMMARY_LANGUAGE,
     SOURCE_IDS_LIMIT_METHOD_KEEP,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
@@ -98,7 +93,6 @@ def _truncate_entity_identifier(
     return display_value
 
 
-@timeit_sync("chunking_by_token_size")
 def chunking_by_token_size(
     tokenizer: Tokenizer,
     content: str,
@@ -354,17 +348,16 @@ async def _summarize_descriptions(
     return summary
 
 
-
 async def _handle_single_entity_extraction(
     record_attributes: list[str],
     chunk_key: str,
     timestamp: int,
     file_path: str = "unknown_source",
 ):
-    if len(record_attributes) != 5 or "entity" not in record_attributes[0]:
-        if("entity" in record_attributes):
+    if len(record_attributes) != 4 or "entity" not in record_attributes[0]:
+        if len(record_attributes) > 1 and "entity" in record_attributes[0]:
             logger.warning(
-                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5 fields on ENTITY `{record_attributes[1] if len(record_attributes) > 1 else 'N/A'}` @ `{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
+                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/4 feilds on ENTITY `{record_attributes[1]}` @ `{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
             )
             logger.debug(record_attributes)
         return None
@@ -381,52 +374,34 @@ async def _handle_single_entity_extraction(
             )
             return None
 
-        # New 5-field format: [entity, entity_name, entity_type_dim1, entity_type_dim2, description]
-        # Process first dimension type
-        entity_type_dim1 = sanitize_and_normalize_extracted_text(
+        # Process entity type with same cleaning pipeline
+        entity_type = sanitize_and_normalize_extracted_text(
             record_attributes[2], remove_inner_quotes=True
         )
 
-        if not entity_type_dim1.strip() or any(
-            char in entity_type_dim1 for char in ["'", "(", ")", "<", ">", "|", "/", "\\"]
+        if not entity_type.strip() or any(
+            char in entity_type for char in ["'", "(", ")", "<", ">", "|", "/", "\\"]
         ):
             logger.warning(
-                f"Entity extraction error: invalid entity type dim1 in: {record_attributes}"
+                f"Entity extraction error: invalid entity type in: {record_attributes}"
             )
             return None
 
         # Remove spaces and convert to lowercase
-        entity_type_dim1 = entity_type_dim1.replace(" ", "").lower()
+        entity_type = entity_type.replace(" ", "").lower()
 
-        # Process second dimension type
-        entity_type_dim2 = sanitize_and_normalize_extracted_text(
-            record_attributes[3], remove_inner_quotes=True
-        )
-
-        if not entity_type_dim2.strip() or any(
-            char in entity_type_dim2 for char in ["'", "(", ")", "<", ">", "|", "/", "\\"]
-        ):
-            logger.warning(
-                f"Entity extraction error: invalid entity type dim2 in: {record_attributes}"
-            )
-            return None
-
-        # Remove spaces and convert to lowercase
-        entity_type_dim2 = entity_type_dim2.replace(" ", "").lower()
-
-        # Process entity description
-        entity_description = sanitize_and_normalize_extracted_text(record_attributes[4])
+        # Process entity description with same cleaning pipeline
+        entity_description = sanitize_and_normalize_extracted_text(record_attributes[3])
 
         if not entity_description.strip():
             logger.warning(
-                f"Entity extraction error: empty description for entity '{entity_name}' of type '{entity_type_dim1}'"
+                f"Entity extraction error: empty description for entity '{entity_name}' of type '{entity_type}'"
             )
             return None
 
         return dict(
             entity_name=entity_name,
-            entity_type_dim1=entity_type_dim1,
-            entity_type_dim2=entity_type_dim2,
+            entity_type=entity_type,
             description=entity_description,
             source_id=chunk_key,
             file_path=file_path,
@@ -452,11 +427,11 @@ async def _handle_single_relationship_extraction(
     file_path: str = "unknown_source",
 ):
     if (
-        len(record_attributes) < 5 or len(record_attributes) > 6 or "relation" not in record_attributes[0]
-    ):  # treat "relationship" and "relation" interchangeable; allow 5 or 6 fields
+        len(record_attributes) != 5 or "relation" not in record_attributes[0]
+    ):  # treat "relationship" and "relation" interchangeable
         if len(record_attributes) > 1 and "relation" in record_attributes[0]:
             logger.warning(
-                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5-6 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
+                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
             )
             logger.debug(record_attributes)
         return None
@@ -498,17 +473,11 @@ async def _handle_single_relationship_extraction(
         edge_description = sanitize_and_normalize_extracted_text(record_attributes[4])
 
         edge_source_id = chunk_key
-        
-        # Handle weight field - it's optional in the current prompt format
-        # If there's a 6th field and it's a valid number, use it; otherwise default to 1.0
-        if len(record_attributes) > 5:
-            try:
-                weight_str = record_attributes[5].strip('"').strip("'")
-                weight = float(weight_str) if is_float_regex(weight_str) else 1.0
-            except (ValueError, IndexError):
-                weight = 1.0
-        else:
-            weight = 1.0
+        weight = (
+            float(record_attributes[-1].strip('"').strip("'"))
+            if is_float_regex(record_attributes[-1].strip('"').strip("'"))
+            else 1.0
+        )
 
         return dict(
             src_id=source,
@@ -1093,8 +1062,7 @@ async def _rebuild_single_entity(
     # Helper function to update entity in both graph and vector storage
     async def _update_entity_storage(
         final_description: str,
-        entity_type_dim1: str,
-        entity_type_dim2: str,
+        entity_type: str,
         file_paths: list[str],
         source_chunk_ids: list[str],
         truncation_info: str = "",
@@ -1104,8 +1072,7 @@ async def _rebuild_single_entity(
             updated_entity_data = {
                 **current_entity,
                 "description": final_description,
-                "entity_type_dim1": entity_type_dim1,
-                "entity_type_dim2": entity_type_dim2,
+                "entity_type": entity_type,
                 "source_id": GRAPH_FIELD_SEP.join(source_chunk_ids),
                 "file_path": GRAPH_FIELD_SEP.join(file_paths)
                 if file_paths
@@ -1125,8 +1092,7 @@ async def _rebuild_single_entity(
                     "entity_name": entity_name,
                     "source_id": updated_entity_data["source_id"],
                     "description": final_description,
-                    "entity_type_dim1": entity_type_dim1,
-                    "entity_type_dim2": entity_type_dim2,
+                    "entity_type": entity_type,
                     "file_path": updated_entity_data["file_path"],
                 }
             }
@@ -1217,13 +1183,10 @@ async def _rebuild_single_entity(
         else:
             final_description = current_entity.get("description", "")
 
-        entity_type_dim1 = current_entity.get("entity_type_dim1", "UNKNOWN")
-        entity_type_dim2 = current_entity.get("entity_type_dim2", "UNKNOWN")
+        entity_type = current_entity.get("entity_type", "UNKNOWN")
         await _update_entity_storage(
             final_description,
-            "",  # No longer needed
-            entity_type_dim1,
-            entity_type_dim2,
+            entity_type,
             file_paths,
             limited_chunk_ids,
         )
@@ -1231,21 +1194,15 @@ async def _rebuild_single_entity(
 
     # Process cached entity data
     descriptions = []
-    entity_types_dim1 = []
-    entity_types_dim2 = []
+    entity_types = []
     file_paths_list = []
     seen_paths = set()
 
     for entity_data in all_entity_data:
         if entity_data.get("description"):
             descriptions.append(entity_data["description"])
-        # Only handle new dual-dimension format
-        if entity_data.get("entity_type_dim1"):
-            entity_types_dim1.append(entity_data["entity_type_dim1"])
-        
-        if entity_data.get("entity_type_dim2"):
-            entity_types_dim2.append(entity_data["entity_type_dim2"])
-        
+        if entity_data.get("entity_type"):
+            entity_types.append(entity_data["entity_type"])
         if entity_data.get("file_path"):
             file_path = entity_data["file_path"]
             if file_path and file_path not in seen_paths:
@@ -1277,25 +1234,14 @@ async def _rebuild_single_entity(
 
     # Remove duplicates while preserving order
     description_list = list(dict.fromkeys(descriptions))
-    entity_types_dim1 = list(dict.fromkeys(entity_types_dim1))
-    entity_types_dim2 = list(dict.fromkeys(entity_types_dim2))
+    entity_types = list(dict.fromkeys(entity_types))
 
-    # Get most common entity types for both dimensions
-    entity_type_dim1 = (
-        max(set(entity_types_dim1), key=entity_types_dim1.count)
-        if entity_types_dim1
-        else current_entity.get("entity_type_dim1", "UNKNOWN")
+    # Get most common entity type
+    entity_type = (
+        max(set(entity_types), key=entity_types.count)
+        if entity_types
+        else current_entity.get("entity_type", "UNKNOWN")
     )
-    
-    entity_type_dim2 = (
-        max(set(entity_types_dim2), key=entity_types_dim2.count)
-        if entity_types_dim2
-        else current_entity.get("entity_type_dim2", "UNKNOWN")
-    )
-    
-    # If dim2 is missing, use default value
-    if not entity_type_dim2 or entity_type_dim2 == "UNKNOWN":
-        entity_type_dim2 = "UNKNOWN"
 
     # Generate final description from entities or fallback to current
     if description_list:
@@ -1319,8 +1265,7 @@ async def _rebuild_single_entity(
 
     await _update_entity_storage(
         final_description,
-        entity_type_dim1,
-        entity_type_dim2,
+        entity_type,
         file_paths_list,
         limited_chunk_ids,
         truncation_info,
@@ -1511,8 +1456,7 @@ async def _rebuild_single_relationship(
                 "entity_id": node_id,
                 "source_id": node_source_id,
                 "description": node_description,
-                "entity_type_dim1": "UNKNOWN",
-                "entity_type_dim2": "UNKNOWN",
+                "entity_type": "UNKNOWN",
                 "file_path": node_file_path,
                 "created_at": node_created_at,
                 "truncate": "",
@@ -1539,8 +1483,7 @@ async def _rebuild_single_relationship(
                         "content": entity_content,
                         "entity_name": node_id,
                         "source_id": node_source_id,
-                        "entity_type_dim1": "UNKNOWN",
-                        "entity_type_dim2": "UNKNOWN",
+                        "entity_type": "UNKNOWN",
                         "file_path": node_file_path,
                     }
                 }
@@ -1619,106 +1562,6 @@ async def _rebuild_single_relationship(
             pipeline_status["history_messages"].append(status_message)
 
 
-def _generate_entity_id_suffix() -> str:
-    """生成六位随机ID后缀，用尖括号包裹"""
-    import random
-    import string
-    return f"<{''.join(random.choices(string.ascii_lowercase + string.ascii_uppercase + string.digits, k=6))}>"
-
-async def _find_most_similar_existing_entity(
-    entity_name: str,
-    entity_type_dim1: str,
-    entity_type_dim2: str,
-    entity_description: str,
-    similarity_threshold: float,
-    entity_vdb: BaseVectorStorage | None,
-    knowledge_graph_inst: BaseGraphStorage,
-) -> tuple[dict | None, float]:
-    """
-
-    Args:
-        entity_name: 实体名称
-        entity_type_dim1: 实体类型维度1
-        entity_type_dim2: 实体类型维度2  
-        entity_description: 实体描述
-        similarity_threshold: 相似度阈值
-        entity_vdb: 实体向量数据库
-        knowledge_graph_inst: 知识图谱实例
-        global_config: 全局配置
-    
-    Returns:
-        tuple[最相似的实体数据, 相似度分数] 或 (None, 0.0) 如果没有找到
-    """
-    return None, 0.0
-    if not entity_vdb:
-        return None, 0.0
-    
-    try:
-        # 构造查询内容用于向量搜索
-        search_content = f"{entity_name}\n{entity_description}"
-        
-        search_results = await entity_vdb.query(
-            query=search_content, 
-            top_k=5,  # 只获取前5个最相似的候选
-        )
-        
-        if not search_results:
-            logger.debug(f"No search results found for entity '{entity_name}' with description: {entity_description[:100]}...")
-            return None, 0.0
-        
-        # 计算与每个候选的相似度
-        best_match = None
-        best_similarity = 0.0
-        candidates_checked = 0
-        type_matches = 0
-        
-        for result in search_results:
-            candidate_name = result.get("entity_name")
-            if not candidate_name:
-                continue
-                
-            # 跳过自己
-            if candidate_name == entity_name:
-                continue
-            
-            candidates_checked += 1
-            try:
-                similarity = result.get('distance')
-                logger.debug(f"Similarity between '{entity_name}' and '{candidate_name}': {similarity:.4f}")
-                
-                # 只考虑类型匹配的候选
-                candidate_node = await knowledge_graph_inst.get_node(candidate_name)
-                if candidate_node:
-                    candidate_type1 = candidate_node.get("entity_type_dim1", "")
-                    candidate_type2 = candidate_node.get("entity_type_dim2", "")
-                    
-                    # 类型完全匹配才考虑
-                    type_match = (candidate_type1 == entity_type_dim1 and candidate_type2 == entity_type_dim2)
-                    if type_match:
-                        type_matches += 1
-                        logger.debug(f"Type match found for '{candidate_name}': ({candidate_type1}, {candidate_type2})")
-                        
-                        if similarity > best_similarity and similarity >= similarity_threshold:
-                            best_similarity = similarity
-                            best_match = candidate_node
-                            logger.debug(f"New best match: '{candidate_name}' with similarity {similarity:.4f}")
-                    else:
-                        logger.debug(f"Type mismatch for '{candidate_name}': expected ({entity_type_dim1}, {entity_type_dim2}), got ({candidate_type1}, {candidate_type2})")
-                else:
-                    logger.debug(f"Node data not found for candidate: {candidate_name}")
-                    
-            except Exception as e:
-                logger.debug(f"Error calculating similarity for {candidate_name}: {e}")
-                continue
-        
-        logger.debug(f"Search completed for '{entity_name}': checked {candidates_checked} candidates, found {type_matches} type matches, best similarity: {best_similarity:.4f}")
-        return best_match, best_similarity
-        
-    except Exception as e:
-        logger.warning(f"Error in optimized vector similarity search for entity {entity_name}: {e}")
-        return None, 0.0
-
-@timeit_async("merge_nodes_then_upsert")
 async def _merge_nodes_then_upsert(
     entity_name: str,
     nodes_data: list[dict],
@@ -1730,484 +1573,273 @@ async def _merge_nodes_then_upsert(
     llm_response_cache: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
 ):
-    """
-    简化的实体处理：为entity name添加唯一ID并直接存储（不进行合并）
-    
-    Args:
-        entity_name: 实体名称
-        nodes_data: 节点数据列表，每个包含描述和类型信息
-        knowledge_graph_inst: 知识图谱实例
-        entity_vdb: 实体向量数据库
-        global_config: 全局配置
-        pipeline_status: 流水线状态
-        pipeline_status_lock: 流水线状态锁
-        llm_response_cache: LLM响应缓存
-        entity_chunks_storage: 实体块存储
-        
-    Returns:
-        处理后的节点数据字典
-    """
-    # 检查取消状态
+    """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
+    already_entity_types = []
+    already_source_ids = []
+    already_description = []
+    already_file_paths = []
+
+    # 1. Get existing node data from knowledge graph
+    already_node = await knowledge_graph_inst.get_node(entity_name)
+    if already_node:
+        already_entity_types.append(already_node["entity_type"])
+        already_source_ids.extend(already_node["source_id"].split(GRAPH_FIELD_SEP))
+        already_file_paths.extend(already_node["file_path"].split(GRAPH_FIELD_SEP))
+        already_description.extend(already_node["description"].split(GRAPH_FIELD_SEP))
+
+    new_source_ids = [dp["source_id"] for dp in nodes_data if dp.get("source_id")]
+
+    existing_full_source_ids = []
+    if entity_chunks_storage is not None:
+        stored_chunks = await entity_chunks_storage.get_by_id(entity_name)
+        if stored_chunks and isinstance(stored_chunks, dict):
+            existing_full_source_ids = [
+                chunk_id for chunk_id in stored_chunks.get("chunk_ids", []) if chunk_id
+            ]
+
+    if not existing_full_source_ids:
+        existing_full_source_ids = [
+            chunk_id for chunk_id in already_source_ids if chunk_id
+        ]
+
+    # 2. Merging new source ids with existing ones
+    full_source_ids = merge_source_ids(existing_full_source_ids, new_source_ids)
+
+    if entity_chunks_storage is not None and full_source_ids:
+        await entity_chunks_storage.upsert(
+            {
+                entity_name: {
+                    "chunk_ids": full_source_ids,
+                    "count": len(full_source_ids),
+                }
+            }
+        )
+
+    # 3. Finalize source_id by applying source ids limit
+    limit_method = global_config.get("source_ids_limit_method")
+    max_source_limit = global_config.get("max_source_ids_per_entity")
+    source_ids = apply_source_ids_limit(
+        full_source_ids,
+        max_source_limit,
+        limit_method,
+        identifier=f"`{entity_name}`",
+    )
+
+    # 4. Only keep nodes not filter by apply_source_ids_limit if limit_method is KEEP
+    if limit_method == SOURCE_IDS_LIMIT_METHOD_KEEP:
+        allowed_source_ids = set(source_ids)
+        filtered_nodes = []
+        for dp in nodes_data:
+            source_id = dp.get("source_id")
+            # Skip descriptions sourced from chunks dropped by the limitation cap
+            if (
+                source_id
+                and source_id not in allowed_source_ids
+                and source_id not in existing_full_source_ids
+            ):
+                continue
+            filtered_nodes.append(dp)
+        nodes_data = filtered_nodes
+    else:  # In FIFO mode, keep all nodes - truncation happens at source_ids level only
+        nodes_data = list(nodes_data)
+
+    # 5. Check if we need to skip summary due to source_ids limit
+    if (
+        limit_method == SOURCE_IDS_LIMIT_METHOD_KEEP
+        and len(existing_full_source_ids) >= max_source_limit
+        and not nodes_data
+    ):
+        if already_node:
+            logger.info(
+                f"Skipped `{entity_name}`: KEEP old chunks {already_source_ids}/{len(full_source_ids)}"
+            )
+            existing_node_data = dict(already_node)
+            return existing_node_data
+        else:
+            logger.error(f"Internal Error: already_node missing for `{entity_name}`")
+            raise ValueError(
+                f"Internal Error: already_node missing for `{entity_name}`"
+            )
+
+    # 6.1 Finalize source_id
+    source_id = GRAPH_FIELD_SEP.join(source_ids)
+
+    # 6.2 Finalize entity type by highest count
+    entity_type = sorted(
+        Counter(
+            [dp["entity_type"] for dp in nodes_data] + already_entity_types
+        ).items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )[0][0]
+
+    # 7. Deduplicate nodes by description, keeping first occurrence in the same document
+    unique_nodes = {}
+    for dp in nodes_data:
+        desc = dp.get("description")
+        if not desc:
+            continue
+        if desc not in unique_nodes:
+            unique_nodes[desc] = dp
+
+    # Sort description by timestamp, then by description length when timestamps are the same
+    sorted_nodes = sorted(
+        unique_nodes.values(),
+        key=lambda x: (x.get("timestamp", 0), -len(x.get("description", ""))),
+    )
+    sorted_descriptions = [dp["description"] for dp in sorted_nodes]
+
+    # Combine already_description with sorted new sorted descriptions
+    description_list = already_description + sorted_descriptions
+    if not description_list:
+        logger.error(f"Entity {entity_name} has no description")
+        raise ValueError(f"Entity {entity_name} has no description")
+
+    # Check for cancellation before LLM summary
     if pipeline_status is not None and pipeline_status_lock is not None:
         async with pipeline_status_lock:
             if pipeline_status.get("cancellation_requested", False):
-                raise PipelineCancelledException("User cancelled during entity processing")
-    
-    # 数据预处理和验证
-    valid_nodes_data = _validate_and_preprocess_nodes_data(nodes_data)
-    if not valid_nodes_data:
-        logger.warning(f"No valid descriptions found for entity '{entity_name}'")
-        return None
-    
-    # 确定实体类型（取最常见的类型）
-    target_entity_type_dim1, target_entity_type_dim2 = _determine_target_entity_types(valid_nodes_data)
-    
-    # 为实体名称添加唯一ID后缀
-    final_entity_name = f"{entity_name}{_generate_entity_id_suffix()}"
-    logger.debug(f"Entity '{entity_name}' -> '{final_entity_name}' (ID added, no merging)")
-    
-    # 生成最终描述
-    all_descriptions = [node_data.get("description", "") for node_data in valid_nodes_data if node_data.get("description")]
-    description = await _generate_final_description(
-        final_entity_name, all_descriptions, global_config, llm_response_cache
-    )
-    
-    # 构建文件路径和源ID
-    file_paths, source_ids = _build_file_paths_and_source_ids_simple(
-        valid_nodes_data, global_config
-    )
-    
-    # 直接更新存储（作为新实体，不进行合并）
-    final_node_data = await _update_storages_simple(
-        final_entity_name=final_entity_name,
-        description=description,
-        entity_type_dim1=target_entity_type_dim1,
-        entity_type_dim2=target_entity_type_dim2,
-        file_path=file_paths,
-        source_id=source_ids,
-        knowledge_graph_inst=knowledge_graph_inst,
-        entity_vdb=entity_vdb,
-        entity_chunks_storage=entity_chunks_storage,
-        global_config=global_config,
-    )
-    
-    # 记录处理状态
-    _log_processing_status_simple(
-        final_entity_name=final_entity_name,
-        description_count=len(all_descriptions),
-        global_config=global_config,
-        pipeline_status=pipeline_status,
-        pipeline_status_lock=pipeline_status_lock,
-    )
-    
-    return final_node_data
+                raise PipelineCancelledException("User cancelled during entity summary")
 
-
-def _validate_and_preprocess_nodes_data(nodes_data: list[dict]) -> list[dict]:
-    """验证和预处理节点数据"""
-    valid_nodes = []
-    for node_data in nodes_data:
-        description = node_data.get("description", "").strip()
-        if description:
-            # 确保必要的字段存在
-            node_data.setdefault("entity_type_dim1", "UNKNOWN")
-            node_data.setdefault("entity_type_dim2", "UNKNOWN")
-            valid_nodes.append(node_data)
-    
-    return valid_nodes
-
-
-def _determine_target_entity_types(sorted_nodes_data: list[dict]) -> tuple[str, str]:
-    """确定目标实体类型（取最常见的类型）"""
-    from collections import Counter
-    
-    # 统计类型出现频率
-    type_dim1_counter = Counter()
-    type_dim2_counter = Counter()
-    
-    for node_data in sorted_nodes_data:
-        type_dim1_counter[node_data.get("entity_type_dim1", "UNKNOWN")] += 1
-        type_dim2_counter[node_data.get("entity_type_dim2", "UNKNOWN")] += 1
-    
-    # 选择最常见的类型
-    target_type_dim1 = type_dim1_counter.most_common(1)[0][0] if type_dim1_counter else "UNKNOWN"
-    target_type_dim2 = type_dim2_counter.most_common(1)[0][0] if type_dim2_counter else "UNKNOWN"
-    
-    return target_type_dim1, target_type_dim2
-
-
-def _build_combined_description(nodes_data: list[dict]) -> str:
-    """构建合并的描述字符串"""
-    descriptions = [node_data.get("description", "") for node_data in nodes_data if node_data.get("description")]
-    
-    return GRAPH_FIELD_SEP.join(descriptions)
-
-
-def _execute_merge_strategy(
-    entity_name: str,
-    most_similar_entity: dict | None,
-    similarity_score: float,
-    sorted_nodes_data: list[dict],
-    target_entity_type_dim1: str,
-    target_entity_type_dim2: str,
-    knowledge_graph_inst: BaseGraphStorage,
-    similarity_threshold: float = 0.8,
-) -> dict | None:
-    """执行合并策略"""
-    
-    if most_similar_entity is None:
-        # 没有找到相似的实体，创建新实体
-        final_entity_name = f"{entity_name}{_generate_entity_id_suffix()}"
-        logger.info(f"Creating new unique entity '{final_entity_name}' (no similar entities found)")
-        
-        all_descriptions = [node_data.get("description", "") for node_data in sorted_nodes_data if node_data.get("description")]
-        existing_node = None
-        merge_type = "new_unique"
-        
-        return {
-            "final_entity_name": final_entity_name,
-            "final_description": "",
-            "final_entity_type_dim1": target_entity_type_dim1,
-            "final_entity_type_dim2": target_entity_type_dim2,
-            "existing_node": existing_node,
-            "all_descriptions": all_descriptions,
-            "merge_type": merge_type,
-        }
-    
-    # 检查实体类型是否一致
-    existing_type_dim1 = most_similar_entity.get("entity_type_dim1", "UNKNOWN")
-    existing_type_dim2 = most_similar_entity.get("entity_type_dim2", "UNKNOWN")
-    
-    type_consistent = (
-        existing_type_dim1 == target_entity_type_dim1 and 
-        existing_type_dim2 == target_entity_type_dim2
-    )
-    
-    if not type_consistent:
-        # 类型不一致，创建新实体
-        final_entity_name = f"{entity_name}{_generate_entity_id_suffix()}"
-        logger.info(f"Creating new unique entity '{final_entity_name}' (type mismatch: existing=({existing_type_dim1}, {existing_type_dim2}), new=({target_entity_type_dim1}, {target_entity_type_dim2}))")
-        
-        all_descriptions = [node_data.get("description", "") for node_data in sorted_nodes_data if node_data.get("description")]
-        existing_node = None
-        merge_type = "type_mismatch"
-        
-        return {
-            "final_entity_name": final_entity_name,
-            "final_description": "",
-            "final_entity_type_dim1": target_entity_type_dim1,
-            "final_entity_type_dim2": target_entity_type_dim2,
-            "existing_node": existing_node,
-            "all_descriptions": all_descriptions,
-            "merge_type": merge_type,
-        }
-    
-    # 类型一致且相似度足够，进行合并 - 但仍然添加ID以保持一致性
-    if similarity_score >= similarity_threshold:
-        final_entity_name = f"{entity_name}{_generate_entity_id_suffix()}"
-        existing_description = most_similar_entity.get("description", "")
-        existing_descriptions = existing_description.split(GRAPH_FIELD_SEP) if existing_description else []
-        
-        new_descriptions = [node_data.get("description", "") for node_data in sorted_nodes_data if node_data.get("description")]
-        
-        # 合并描述，去重
-        combined_descriptions = existing_descriptions + new_descriptions
-        seen = set()
-        unique_descriptions = []
-        for desc in combined_descriptions:
-            if desc not in seen:
-                seen.add(desc)
-                unique_descriptions.append(desc)
-        
-        logger.info(f"Merged '{entity_name}' into new unique entity '{final_entity_name}' (similarity: {similarity_score:.3f})")
-        merge_type = "merge_existing_with_id"
-        
-        return {
-            "final_entity_name": final_entity_name,
-            "final_description": existing_description,
-            "final_entity_type_dim1": target_entity_type_dim1,
-            "final_entity_type_dim2": target_entity_type_dim2,
-            "existing_node": most_similar_entity,
-            "all_descriptions": unique_descriptions,
-            "merge_type": merge_type,
-        }
-    else:
-        # 相似度不够，创建新实体
-        final_entity_name = f"{entity_name}{_generate_entity_id_suffix()}"
-        logger.info(f"Creating new unique entity '{final_entity_name}' (similarity too low: {similarity_score:.3f})")
-        
-        all_descriptions = [node_data.get("description", "") for node_data in sorted_nodes_data if node_data.get("description")]
-        existing_node = None
-        merge_type = "low_similarity"
-        
-        return {
-            "final_entity_name": final_entity_name,
-            "final_description": "",
-            "final_entity_type_dim1": target_entity_type_dim1,
-            "final_entity_type_dim2": target_entity_type_dim2,
-            "existing_node": existing_node,
-            "all_descriptions": all_descriptions,
-            "merge_type": merge_type,
-        }
-
-
-async def _generate_final_description(
-    entity_name: str,
-    all_descriptions: list[str],
-    global_config: dict,
-    llm_response_cache: BaseKVStorage | None = None,
-) -> str:
-    """生成最终描述"""
-    
-    if len(all_descriptions) <= 4:
-        # 少于等于4个描述，不需要LLM总结
-        return GRAPH_FIELD_SEP.join(all_descriptions) if all_descriptions else ""
-    else:
-        # 使用LLM总结
-        description, _ = await _handle_entity_relation_summary(
-            "Entity",
-            entity_name,
-            all_descriptions,
-            GRAPH_FIELD_SEP,
-            global_config,
-            llm_response_cache,
-        )
-        return description
-
-
-def _build_file_paths_and_source_ids(
-    merge_result: dict,
-    global_config: dict,
-) -> tuple[str, str]:
-    """构建文件路径和源ID"""
-    
-    # 这里需要根据实际的merge_result结构来实现
-    # 暂时返回默认值，需要根据实际需求调整
-    file_paths = "unknown_source"
-    source_ids = ""
-    
-    return file_paths, source_ids
-
-
-async def _update_storages(
-    final_entity_name: str,
-    description: str,
-    entity_type_dim1: str,
-    entity_type_dim2: str,
-    file_path: str,
-    source_id: str,
-    existing_node: dict | None,
-    knowledge_graph_inst: BaseGraphStorage,
-    entity_vdb: BaseVectorStorage | None,
-    entity_chunks_storage: BaseKVStorage | None,
-    global_config: dict,
-) -> dict:
-    """更新存储（知识图谱和向量数据库）
-    
-    注意：此函数假设调用方已经持有实体名称的锁，不会再次获取锁以避免死锁。
-    调用方（如 merge_nodes_and_edges 中的 _locked_process_entity_name）
-    负责在调用前获取适当的锁。
-    """
-    
-    # 构建节点数据
-    node_data = dict(
-        entity_id=final_entity_name,
-        entity_type_dim1=entity_type_dim1,
-        entity_type_dim2=entity_type_dim2,
-        description=description,
-        source_id=source_id,
-        file_path=file_path,
-        created_at=int(time.time()) if not existing_node else existing_node.get("created_at", int(time.time())),
-        truncate="",
+    # 8. Get summary description an LLM usage status
+    description, llm_was_used = await _handle_entity_relation_summary(
+        "Entity",
+        entity_name,
+        description_list,
+        GRAPH_FIELD_SEP,
+        global_config,
+        llm_response_cache,
     )
 
-    # 更新知识图谱
-    await knowledge_graph_inst.upsert_node(final_entity_name, node_data=node_data)
-
-    # 更新向量数据库
-    if entity_vdb is not None:
-        # 保持与知识图谱一致的entity_id（包含尖括号ID）
-        entity_vdb_id = compute_mdhash_id(str(final_entity_name), prefix="ent-")
-        entity_content = f"{final_entity_name}\n{description}"
-        vdb_data = {
-            entity_vdb_id: {
-                "entity_name": final_entity_name,
-                "entity_type_dim1": entity_type_dim1,
-                "entity_type_dim2": entity_type_dim2,
-                "content": entity_content,
-                "source_id": source_id,
-                "file_path": file_path,
-            }
-        }
-        await safe_vdb_operation_with_exception(
-            operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
-            operation_name="entity_upsert",
-            entity_name=final_entity_name,
-            max_retries=3,
-            retry_delay=0.1,
-        )
-
-    # 写操作成功
-    node_data["entity_name"] = final_entity_name
-    return node_data
-
-
-def _build_file_paths_and_source_ids_simple(
-    nodes_data: list[dict],
-    global_config: dict,
-) -> tuple[str, str]:
-    """简化的文件路径和源ID构建"""
-    
-    # 收集所有文件路径
+    # 9. Build file_path within MAX_FILE_PATHS
     file_paths_list = []
     seen_paths = set()
-    source_ids_list = []
-    seen_source_ids = set()
-    
-    for node_data in nodes_data:
-        # 处理文件路径
-        if node_data.get("file_path"):
-            file_path = node_data["file_path"]
-            if file_path and file_path not in seen_paths:
-                file_paths_list.append(file_path)
-                seen_paths.add(file_path)
-        
-        # 处理源ID
-        if node_data.get("source_id"):
-            source_id = node_data["source_id"]
-            if source_id and source_id not in seen_source_ids:
-                source_ids_list.append(source_id)
-                seen_source_ids.add(source_id)
-    
-    # 应用文件路径限制
+    has_placeholder = False  # Indicating file_path has been truncated before
+
     max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
+    file_path_placeholder = global_config.get(
+        "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
+    )
+
+    # Collect from already_file_paths, excluding placeholder
+    for fp in already_file_paths:
+        if fp and fp.startswith(f"...{file_path_placeholder}"):  # Skip placeholders
+            has_placeholder = True
+            continue
+        if fp and fp not in seen_paths:
+            file_paths_list.append(fp)
+            seen_paths.add(fp)
+
+    # Collect from new data
+    for dp in nodes_data:
+        file_path_item = dp.get("file_path")
+        if file_path_item and file_path_item not in seen_paths:
+            file_paths_list.append(file_path_item)
+            seen_paths.add(file_path_item)
+
+    # Apply count limit
     if len(file_paths_list) > max_file_paths:
-        # 保持最早的文件路径
-        file_paths_list = file_paths_list[:max_file_paths]
+        limit_method = global_config.get(
+            "source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP
+        )
         file_path_placeholder = global_config.get(
             "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
         )
-        file_paths_list.append(f"...{file_path_placeholder}...({len(file_paths_list)}/{max_file_paths})")
-        logger.info(f"Limited entity: file_path {len(file_paths_list)} -> {max_file_paths}")
-    
-    # 组合最终结果
-    file_paths = GRAPH_FIELD_SEP.join(file_paths_list) if file_paths_list else "unknown_source"
-    source_ids = GRAPH_FIELD_SEP.join(source_ids_list) if source_ids_list else ""
-    
-    return file_paths, source_ids
+        # Add + sign to indicate actual file count is higher
+        original_count_str = (
+            f"{len(file_paths_list)}+" if has_placeholder else str(len(file_paths_list))
+        )
 
+        if limit_method == SOURCE_IDS_LIMIT_METHOD_FIFO:
+            # FIFO: keep tail (newest), discard head
+            file_paths_list = file_paths_list[-max_file_paths:]
+            file_paths_list.append(f"...{file_path_placeholder}...(FIFO)")
+        else:
+            # KEEP: keep head (earliest), discard tail
+            file_paths_list = file_paths_list[:max_file_paths]
+            file_paths_list.append(f"...{file_path_placeholder}...(KEEP Old)")
 
-async def _update_storages_simple(
-    final_entity_name: str,
-    description: str,
-    entity_type_dim1: str,
-    entity_type_dim2: str,
-    file_path: str,
-    source_id: str,
-    knowledge_graph_inst: BaseGraphStorage,
-    entity_vdb: BaseVectorStorage | None,
-    entity_chunks_storage: BaseKVStorage | None,
-    global_config: dict,
-) -> dict:
-    """简化的存储更新（作为新实体插入）"""
-    
-    # 构建节点数据
+        logger.info(
+            f"Limited `{entity_name}`: file_path {original_count_str} -> {max_file_paths} ({limit_method})"
+        )
+    # Finalize file_path
+    file_path = GRAPH_FIELD_SEP.join(file_paths_list)
+
+    # 10.Log based on actual LLM usage
+    num_fragment = len(description_list)
+    already_fragment = len(already_description)
+    if llm_was_used:
+        status_message = f"LLMmrg: `{entity_name}` | {already_fragment}+{num_fragment - already_fragment}"
+    else:
+        status_message = f"Merged: `{entity_name}` | {already_fragment}+{num_fragment - already_fragment}"
+
+    truncation_info = truncation_info_log = ""
+    if len(source_ids) < len(full_source_ids):
+        # Add truncation info from apply_source_ids_limit if truncation occurred
+        truncation_info_log = f"{limit_method} {len(source_ids)}/{len(full_source_ids)}"
+        if limit_method == SOURCE_IDS_LIMIT_METHOD_FIFO:
+            truncation_info = truncation_info_log
+        else:
+            truncation_info = "KEEP Old"
+
+    deduplicated_num = already_fragment + len(nodes_data) - num_fragment
+    dd_message = ""
+    if deduplicated_num > 0:
+        # Duplicated description detected across multiple trucks for the same entity
+        dd_message = f"dd {deduplicated_num}"
+
+    if dd_message or truncation_info_log:
+        status_message += (
+            f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
+        )
+
+    # Add message to pipeline satus when merge happens
+    if already_fragment > 0 or llm_was_used:
+        logger.info(status_message)
+        if pipeline_status is not None and pipeline_status_lock is not None:
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = status_message
+                pipeline_status["history_messages"].append(status_message)
+    else:
+        logger.debug(status_message)
+
+    # 11. Update both graph and vector db
     node_data = dict(
-        entity_id=final_entity_name,
-        entity_type_dim1=entity_type_dim1,
-        entity_type_dim2=entity_type_dim2,
+        entity_id=entity_name,
+        entity_type=entity_type,
         description=description,
         source_id=source_id,
         file_path=file_path,
         created_at=int(time.time()),
-        truncate="",
+        truncate=truncation_info,
     )
-
-    # 更新知识图谱
-    await knowledge_graph_inst.upsert_node(final_entity_name, node_data=node_data)
-
-    # 更新向量数据库
+    await knowledge_graph_inst.upsert_node(
+        entity_name,
+        node_data=node_data,
+    )
+    node_data["entity_name"] = entity_name
     if entity_vdb is not None:
-        # 保持与知识图谱一致的entity_id（包含尖括号ID）
-        entity_vdb_id = compute_mdhash_id(str(final_entity_name), prefix="ent-")
-        entity_content = f"{final_entity_name}\n{description}"
-        vdb_data = {
+        entity_vdb_id = compute_mdhash_id(str(entity_name), prefix="ent-")
+        entity_content = f"{entity_name}\n{description}"
+        data_for_vdb = {
             entity_vdb_id: {
-                "entity_name": final_entity_name,
-                "entity_type_dim1":entity_type_dim1,
-                "entity_type_dim2": entity_type_dim2,
+                "entity_name": entity_name,
+                "entity_type": entity_type,
                 "content": entity_content,
                 "source_id": source_id,
                 "file_path": file_path,
             }
         }
         await safe_vdb_operation_with_exception(
-            operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
-            operation_name="entity_upsert_simple",
-            entity_name=final_entity_name,
+            operation=lambda payload=data_for_vdb: entity_vdb.upsert(payload),
+            operation_name="entity_upsert",
+            entity_name=entity_name,
             max_retries=3,
             retry_delay=0.1,
         )
-
-    # 添加到entity_chunks_storage
-    if entity_chunks_storage is not None and source_id:
-        chunk_ids = [chunk_id.strip() for chunk_id in source_id.split(GRAPH_FIELD_SEP) if chunk_id.strip()]
-        if chunk_ids:
-            await entity_chunks_storage.upsert(
-                {
-                    final_entity_name: {
-                        "chunk_ids": chunk_ids,
-                        "count": len(chunk_ids),
-                    }
-                }
-            )
-
-    # 返回最终节点数据
-    node_data["entity_name"] = final_entity_name
     return node_data
 
 
-def _log_processing_status_simple(
-    final_entity_name: str,
-    description_count: int,
-    global_config: dict,
-    pipeline_status: dict = None,
-    pipeline_status_lock=None,
-) -> None:
-    """简化的处理状态记录"""
-    
-    status_message = f"NewUnique: `{final_entity_name}` | {description_count} fragments"
-    
-    logger.info(status_message)
-    
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # 如果在异步上下文中，创建任务
-                asyncio.create_task(_update_pipeline_status_async(pipeline_status, pipeline_status_lock, status_message))
-            else:
-                # 如果不在异步上下文中，直接更新
-                asyncio.run(_update_pipeline_status_async(pipeline_status, pipeline_status_lock, status_message))
-        except Exception as e:
-            logger.warning(f"Failed to update pipeline status: {e}")
-
-
-async def _update_pipeline_status_async(pipeline_status: dict, pipeline_status_lock, status_message: str) -> None:
-    """异步更新流水线状态"""
-    async with pipeline_status_lock:
-        pipeline_status["latest_message"] = status_message
-        pipeline_status["history_messages"].append(status_message)
-
-
-
-    """异步更新流水线状态"""
-    async with pipeline_status_lock:
-        pipeline_status["latest_message"] = status_message
-        pipeline_status["history_messages"].append(status_message)
-
-@timeit_async("merge_edges_then_upsert")
 async def _merge_edges_then_upsert(
     src_id: str,
     tgt_id: str,
@@ -2511,20 +2143,17 @@ async def _merge_edges_then_upsert(
 
         if existing_node is None:
             # Node doesn't exist - create new node
-            # 为新实体生成带随机ID的完整ID（修复UNKNOWN实体没有随机ID的BUG）
-            final_entity_id = f"{need_insert_id}{_generate_entity_id_suffix()}"
             node_created_at = int(time.time())
             node_data = {
-                "entity_id": final_entity_id,
+                "entity_id": need_insert_id,
                 "source_id": source_id,
                 "description": description,
-                "entity_type_dim1": "UNKNOWN",
-                "entity_type_dim2": "UNKNOWN",
+                "entity_type": "UNKNOWN",
                 "file_path": file_path,
                 "created_at": node_created_at,
                 "truncate": "",
             }
-            await knowledge_graph_inst.upsert_node(final_entity_id, node_data=node_data)
+            await knowledge_graph_inst.upsert_node(need_insert_id, node_data=node_data)
 
             # Update entity_chunks_storage for the newly created entity
             if entity_chunks_storage is not None:
@@ -2532,7 +2161,7 @@ async def _merge_edges_then_upsert(
                 if chunk_ids:
                     await entity_chunks_storage.upsert(
                         {
-                            final_entity_id: {
+                            need_insert_id: {
                                 "chunk_ids": chunk_ids,
                                 "count": len(chunk_ids),
                             }
@@ -2540,22 +2169,21 @@ async def _merge_edges_then_upsert(
                     )
 
             if entity_vdb is not None:
-                entity_vdb_id = compute_mdhash_id(final_entity_id, prefix="ent-")
-                entity_content = f"{final_entity_id}\n{description}"
+                entity_vdb_id = compute_mdhash_id(need_insert_id, prefix="ent-")
+                entity_content = f"{need_insert_id}\n{description}"
                 vdb_data = {
                     entity_vdb_id: {
                         "content": entity_content,
-                        "entity_name": final_entity_id,
+                        "entity_name": need_insert_id,
                         "source_id": source_id,
-                        "entity_type_dim1": "UNKNOWN",
-                        "entity_type_dim2": "UNKNOWN",
+                        "entity_type": "UNKNOWN",
                         "file_path": file_path,
                     }
                 }
                 await safe_vdb_operation_with_exception(
                     operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
                     operation_name="added_entity_upsert",
-                    entity_name=final_entity_id,
+                    entity_name=need_insert_id,
                     max_retries=3,
                     retry_delay=0.1,
                 )
@@ -2563,9 +2191,8 @@ async def _merge_edges_then_upsert(
             # Track entities added during edge processing
             if added_entities is not None:
                 entity_data = {
-                    "entity_name": final_entity_id,
-                    "entity_type_dim1": "UNKNOWN",
-                    "entity_type_dim2": "UNKNOWN",
+                    "entity_name": need_insert_id,
+                    "entity_type": "UNKNOWN",
                     "description": description,
                     "source_id": source_id,
                     "file_path": file_path,
@@ -2653,8 +2280,7 @@ async def _merge_edges_then_upsert(
                             "content": entity_content,
                             "entity_name": need_insert_id,
                             "source_id": limited_source_id_str,
-                            "entity_type_dim1": existing_node.get("entity_type_dim1", "UNKNOWN"),
-                            "entity_type_dim2": existing_node.get("entity_type_dim2", "UNKNOWN"),
+                            "entity_type": existing_node.get("entity_type", "UNKNOWN"),
                             "file_path": existing_node.get(
                                 "file_path", "unknown_source"
                             ),
@@ -2741,7 +2367,6 @@ async def _merge_edges_then_upsert(
     return edge_data
 
 
-@timeit_async("merge_nodes_and_edges")
 async def merge_nodes_and_edges(
     chunk_results: list,
     knowledge_graph_inst: BaseGraphStorage,
@@ -2826,9 +2451,6 @@ async def merge_nodes_and_edges(
         pipeline_status["latest_message"] = log_message
         pipeline_status["history_messages"].append(log_message)
 
-    # 记录实体名称映射：原始名称 -> 最终名称
-    entity_name_mapping = {}
-
     async def _locked_process_entity_name(entity_name, entities):
         async with semaphore:
             # Check for cancellation before processing entity
@@ -2857,12 +2479,6 @@ async def merge_nodes_and_edges(
                         llm_response_cache,
                         entity_chunks_storage,
                     )
-
-                    # 记录实体名称映射
-                    if entity_data and entity_data.get("entity_name"):
-                        final_entity_name = entity_data["entity_name"]
-                        entity_name_mapping[entity_name] = final_entity_name
-                        logger.debug(f"Entity mapping: '{entity_name}' -> '{final_entity_name}'")
 
                     return entity_data
 
@@ -2929,14 +2545,13 @@ async def merge_nodes_and_edges(
         if first_exception is not None:
             raise first_exception
 
-    # Phase 1完成后，记录实体映射信息
-    log_message = f"Phase 1 completed: Entity name mapping collected ({len(entity_name_mapping)} mappings)"
+    # ===== Phase 2: Process all relationships concurrently =====
+    log_message = f"Phase 2: Processing {total_relations_count} relations from {doc_id} (async: {graph_max_async})"
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
         pipeline_status["history_messages"].append(log_message)
 
-    # ===== Phase 2: Process all relationships concurrently =====
     async def _locked_process_edges(edge_key, edges):
         async with semaphore:
             # Check for cancellation before processing edges
@@ -2959,16 +2574,10 @@ async def merge_nodes_and_edges(
                 try:
                     added_entities = []  # Track entities added during edge processing
 
-                    # 使用实体名称映射将原始实体名称转换为最终ID（带随机ID后缀）
-                    original_src_id = edge_key[0]
-                    original_tgt_id = edge_key[1]
-                    final_src_id = entity_name_mapping.get(original_src_id, original_src_id)
-                    final_tgt_id = entity_name_mapping.get(original_tgt_id, original_tgt_id)
-
-                    logger.debug(f"Processing relation {sorted_edge_key} (mapped: {original_src_id} -> {final_src_id}, {original_tgt_id} -> {final_tgt_id})")
+                    logger.debug(f"Processing relation {sorted_edge_key}")
                     edge_data = await _merge_edges_then_upsert(
-                        final_src_id,
-                        final_tgt_id,
+                        edge_key[0],
+                        edge_key[1],
                         edges,
                         knowledge_graph_inst,
                         relationships_vdb,
@@ -3011,34 +2620,9 @@ async def merge_nodes_and_edges(
                     )
                     raise prefixed_exception from e
 
-    # 在处理关系前，先转换关系的source_id和target_id为最终实体名称
-    converted_edges = {}
-    for edge_key, edges in all_edges.items():
-        original_src, original_tgt = edge_key
-        
-        # 转换源和目标实体名称
-        final_src = entity_name_mapping.get(original_src, original_src)
-        final_tgt = entity_name_mapping.get(original_tgt, original_tgt)
-        
-        # 如果有映射变化，记录日志
-        if final_src != original_src or final_tgt != original_tgt:
-            logger.debug(f"Edge mapping: ({original_src}, {original_tgt}) -> ({final_src}, {final_tgt})")
-        
-        # 使用最终名称作为新的边键
-        final_edge_key = (final_src, final_tgt)
-        converted_edges[final_edge_key] = edges
-
-    # 记录转换后的关系信息
-    converted_count = len(all_edges) - len(converted_edges)
-    log_message = f"Phase 2: Processing {total_relations_count} relations from {doc_id} (converted {converted_count} edges, async: {graph_max_async})"
-    logger.info(log_message)
-    async with pipeline_status_lock:
-        pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
-
     # Create relationship processing tasks
     edge_tasks = []
-    for edge_key, edges in converted_edges.items():
+    for edge_key, edges in all_edges.items():
         task = asyncio.create_task(_locked_process_edges(edge_key, edges))
         edge_tasks.append(task)
 
@@ -3153,7 +2737,6 @@ async def merge_nodes_and_edges(
         pipeline_status["history_messages"].append(log_message)
 
 
-@timeit_async("extract_entities")
 async def extract_entities(
     chunks: dict[str, TextChunkSchema],
     global_config: dict[str, str],
@@ -3176,12 +2759,8 @@ async def extract_entities(
     ordered_chunks = list(chunks.items())
     # add language and example number params to prompt
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
-    # 获取两个维度的实体类型
-    entity_types_dim1 = global_config["addon_params"].get(
-        "entity_types_dim1", DEFAULT_ENTITY_TYPES_DIM1
-    )
-    entity_types_dim2 = global_config["addon_params"].get(
-        "entity_types_dim2", DEFAULT_ENTITY_TYPES_DIM2
+    entity_types = global_config["addon_params"].get(
+        "entity_types", DEFAULT_ENTITY_TYPES
     )
 
     examples = "\n".join(PROMPTS["entity_extraction_examples"])
@@ -3189,8 +2768,7 @@ async def extract_entities(
     example_context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        entity_types_dim1=", ".join(entity_types_dim1),
-        entity_types_dim2=", ".join(entity_types_dim2),
+        entity_types=", ".join(entity_types),
         language=language,
     )
     # add example's format
@@ -3199,8 +2777,7 @@ async def extract_entities(
     context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        entity_types_dim1=",".join(entity_types_dim1),
-        entity_types_dim2=",".join(entity_types_dim2),
+        entity_types=",".join(entity_types),
         examples=examples,
         language=language,
     )
@@ -4035,8 +3612,7 @@ async def _apply_token_truncation(
         entities_context.append(
             {
                 "entity": entity_name,
-                "type_dim1": entity.get("entity_type_dim1", "UNKNOWN"),
-                "type_dim2": entity.get("entity_type_dim2", "UNKNOWN"),
+                "type": entity.get("entity_type", "UNKNOWN"),
                 "description": entity.get("description", "UNKNOWN"),
                 "created_at": created_at,
                 "file_path": entity.get("file_path", "unknown_source"),

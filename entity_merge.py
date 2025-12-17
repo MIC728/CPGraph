@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=".env", override=False)
 
-# LightRAG 常量和提示词（仍需要用于实体合并逻辑）
+# LightRAG 常量和提示词（需要用于实体合并逻辑）
 from lightrag.prompt import PROMPTS
 from lightrag.constants import (
     DEFAULT_ENTITY_TYPES_DIM1,

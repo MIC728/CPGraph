@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Neo4j 向量索引创建脚本
 创建 Entity 和 Relationship 的向量索引以支持相似度搜索

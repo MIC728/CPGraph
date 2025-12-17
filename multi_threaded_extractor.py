@@ -1,8 +1,5 @@
 """
-LightRAG 多线程异步文件提取模块
-
-完全接管 LightRAG 的文件处理和实体提取流程，实现真正的多线程+异步并发化。
-参考 LightRAG文件提取流程重构计划.md 的架构设计。
+CPGraph 多线程异步文件提取模块
 
 主要特性:
 - 多线程并行处理 (ThreadPoolExecutor)
