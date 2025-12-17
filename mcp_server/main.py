@@ -17,10 +17,17 @@ from kg_query_engine import KGQueryEngine
 from py2neo import Graph
 from dotenv import load_dotenv
 import pathlib
+from lightrag.utils import setup_logger, get_env_value
 
-# 设置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# 设置日志 - 复用LightRAG logger
+log_level = get_env_value("LOG_LEVEL", "INFO", str).upper()
+setup_logger(
+    logger_name="CPGraph",
+    level=log_level,
+    add_filter=False,
+    enable_file_logging=False  # Console only
+)
+logger = logging.getLogger("CPGraph")
 
 # 加载 .env 文件 - 尝试多个可能的路径
 script_dir = pathlib.Path(__file__).parent.resolve()

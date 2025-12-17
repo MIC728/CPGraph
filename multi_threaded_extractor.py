@@ -23,7 +23,7 @@ from typing import List, Dict, Any, Tuple, Callable
 
 # LightRAG 相关导入
 from lightrag.operate import chunking_by_token_size
-from lightrag.utils import compute_mdhash_id, TiktokenTokenizer
+from lightrag.utils import compute_mdhash_id, TiktokenTokenizer, setup_logger, get_env_value
 from lightrag.prompt import PROMPTS
 
 
@@ -36,9 +36,15 @@ def get_default_tokenizer():
     """
     return TiktokenTokenizer("gpt-4o-mini")
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# 配置日志 - 复用LightRAG logger
+log_level = get_env_value("LOG_LEVEL", "INFO", str).upper()
+setup_logger(
+    logger_name="CPGraph",
+    level=log_level,
+    add_filter=False,
+    enable_file_logging=False  # Console only, matching original behavior
+)
+logger = logging.getLogger("CPGraph")
 
 
 @dataclass

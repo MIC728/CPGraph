@@ -184,8 +184,8 @@ async def main():
     )
 
     parser.add_argument('input_path', help='输入路径（文件夹或文件）')
-    parser.add_argument('--mode', choices=['normal', 'problem'], required=True,
-                       help='提取模式: normal(普通文本) 或 problem(题目文本)')
+    parser.add_argument('--mode', choices=['normal', 'problem'], default='normal',
+                       help='提取模式: normal(普通文本) 或 problem(题目文本)，默认 normal')
 
     args = parser.parse_args()
 

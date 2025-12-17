@@ -1,6 +1,6 @@
 """
 简洁的LLM摘要服务 - 直接调用OpenAI API，移除对外部llm_func的依赖
-参考lightrag/operate.py、test.py和lightrag/prompt.py的设计理念
+参考lightrag/operate.py的设计理念
 """
 
 import asyncio

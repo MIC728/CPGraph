@@ -1,7 +1,6 @@
 """
 实体合并模块 - 处理新架构提取的实体和关系数据
 
-从新架构 (multi_threaded_extractor.py) 输出的 JSON 文件加载数据，
 进行实体合并、去重、类型校正等处理。
 """
 
@@ -30,24 +29,21 @@ from lightrag.constants import (
 # 导入LLM摘要服务
 from llm_summary_service import LLMSummaryService
 
-# 设置日志（非缓冲模式，解决多线程日志延迟问题）
 import sys
 
-class UnbufferedHandler(logging.StreamHandler):
-    """非缓冲日志处理器，解决多线程日志输出延迟问题"""
-    def emit(self, record):
-        super().emit(record)
-        self.flush()  # 立即刷新输出
+from lightrag.utils import setup_logger, get_env_value
 
-# 配置根日志记录器
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[UnbufferedHandler(sys.stdout)]
+# Configure logger using LightRAG's standard setup_logger
+# This ensures all LOG_* environment variables are properly respected
+log_level = get_env_value("LOG_LEVEL", "INFO", str).upper()
+setup_logger(
+    logger_name="CPGraph",
+    level=log_level,
+    add_filter=False,
+    enable_file_logging=False
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("CPGraph")
 
-
-# ==================== 增量更新配置 ====================
 
 def get_incremental_config() -> Dict[str, Any]:
     """
@@ -3208,7 +3204,7 @@ async def main():
 
     try:
         # 从环境变量获取输入目录
-        input_dir = os.getenv("ENTITY_MERGE_INPUT_DIR", "./new_rag_storage")
+        input_dir = os.getenv("EXTRACTOR_OUTPUT_DIR", "./extracted_data")
         entities_file = os.path.join(input_dir, "entities.json")
         relations_file = os.path.join(input_dir, "relations.json")
 
@@ -3219,7 +3215,7 @@ async def main():
             return
 
         # 创建数据加载器（使用环境变量中的路径）
-        merged_data_dir = os.getenv("ENTITY_MERGE_OUTPUT_DIR", "./merged_data")
+        merged_data_dir = os.getenv("MERGED_DATA_DIR", "./merged_data")
         loader = EntityDataLoader(output_dir=merged_data_dir)
 
         # 从 JSON 文件加载数据
