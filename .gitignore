@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+.env
+*.log
+
+.idea/
+.claude/
+
+merged_data/
+kg_storage
+*.json
