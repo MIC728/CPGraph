@@ -363,7 +363,7 @@ def get_tracker():
             count_tokens=True,
             count_chars=True,
             track_timing=True,
-            export_to_file=True,  # 自动导出到文件
+            export_to_file=False,
             export_path="./llm_usage_stats.json"
         )
     return _tracker

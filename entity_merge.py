@@ -3395,6 +3395,19 @@ async def main():
             clear_existing=clear_neo4j
         )
 
+        # ==================== 创建向量索引 ====================
+        logger.info("=" * 60)
+        logger.info("创建向量索引")
+        logger.info("=" * 60)
+
+        create_vector_indexes_success = create_neo4j_vector_indexes(
+            embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
+            create_pagerank=True
+        )
+
+        if not create_vector_indexes_success:
+            logger.warning("向量索引创建失败，但不影响主流程")
+
         print("\n" + "="*60)
         print("实体合并完成!")
         print("="*60)
@@ -3404,6 +3417,7 @@ async def main():
         print(f"合并后关系: {len(merged_relations)}")
         print(f"Neo4j实体: {neo4j_stats['entities_upserted']}")
         print(f"Neo4j关系: {neo4j_stats['relations_upserted']}")
+        print(f"向量索引: {'✅' if create_vector_indexes_success else '❌'}")
         print("="*60)
 
     except Exception as e:
@@ -3721,6 +3735,177 @@ async def save_to_neo4j(
     return stats
 
 
+def create_neo4j_vector_indexes(
+    embedding_dim: int = None,
+    create_pagerank: bool = True
+) -> bool:
+    """
+    在Neo4j中创建向量索引并计算PageRank（集成到实体合并流程末尾）
+
+    Args:
+        embedding_dim: 向量维度，默认从环境变量读取
+        create_pagerank: 是否计算PageRank
+
+    Returns:
+        bool: 是否成功创建索引
+    """
+    from py2neo import Graph
+
+    logger.info("=" * 60)
+    logger.info("创建Neo4j向量索引")
+    logger.info("=" * 60)
+
+    try:
+        # 读取配置
+        uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        user = os.getenv("NEO4J_USERNAME", "neo4j")
+        password = os.getenv("NEO4J_PASSWORD", "password")
+        embedding_dim = embedding_dim or int(os.getenv("EMBEDDING_DIM", "1024"))
+
+        logger.info(f"Neo4j连接: {uri}")
+        logger.info(f"向量维度: {embedding_dim}")
+
+        # 创建连接
+        graph = Graph(uri, auth=(user, password))
+
+        # 测试连接
+        result = graph.run("RETURN 1 as test").evaluate()
+        logger.info(f"连接测试成功: {result}")
+
+        # 检查现有索引
+        existing_indexes = graph.run("SHOW INDEXES").to_data_frame()
+        vector_indexes = existing_indexes[existing_indexes['type'] == 'VECTOR']
+
+        if not vector_indexes.empty:
+            logger.info(f"发现 {len(vector_indexes)} 个现有向量索引")
+
+        # 创建Entity向量索引
+        entity_index_name = "entity_embedding_index"
+
+        # 检查索引是否已存在
+        if entity_index_name in existing_indexes['name'].values:
+            logger.info(f"删除旧索引: {entity_index_name}")
+            graph.run(f"DROP INDEX {entity_index_name} IF EXISTS").evaluate()
+
+        # 创建新索引
+        graph.run(f"""
+            CREATE VECTOR INDEX {entity_index_name}
+            FOR (e:Entity) ON (e.embedding)
+            OPTIONS {{
+              indexConfig: {{
+                `vector.dimensions`: {embedding_dim},
+                `vector.similarity_function`: 'cosine'
+              }}
+            }}
+        """).evaluate()
+
+        logger.info(f"向量索引创建成功: {entity_index_name}")
+
+        # 计算PageRank
+        if create_pagerank:
+            logger.info("计算全图PageRank...")
+            try:
+                # 检查GDS是否可用
+                gds_version = graph.run("RETURN gds.version()").evaluate()
+                logger.info(f"GDS版本: {gds_version}")
+
+                # 删除已存在的图投影（如果存在）
+                try:
+                    graph.run("CALL gds.graph.drop('entity_graph', false)").evaluate()
+                    logger.info("已删除旧的图投影 'entity_graph'")
+                except Exception:
+                    pass  # 图投影不存在，忽略
+
+                # 创建图投影
+                graph.run("""
+                    CALL gds.graph.project(
+                        'entity_graph',
+                        'Entity',
+                        {
+                            RELATIONSHIP: {
+                                type: '*',
+                                orientation: 'UNDIRECTED'
+                            }
+                        }
+                    )
+                """).evaluate()
+
+                # 运行PageRank算法
+                pagerank_result = graph.run("""
+                    CALL gds.pageRank.write('entity_graph', {
+                        writeProperty: 'pagerank',
+                        dampingFactor: 0.85,
+                        maxIterations: 40
+                    })
+                    YIELD nodePropertiesWritten
+                    RETURN nodePropertiesWritten
+                """).evaluate()
+
+                logger.info(f"PageRank计算完成，写入 {pagerank_result} 个节点")
+
+                # 删除图投影
+                graph.run("CALL gds.graph.drop('entity_graph')").evaluate()
+
+                # 创建PageRank索引
+                graph.run("""
+                    CREATE INDEX entity_pagerank_idx IF NOT EXISTS
+                    FOR (e:Entity) ON (e.pagerank)
+                """).evaluate()
+
+                logger.info("PageRank索引创建成功")
+
+            except Exception as e:
+                if "gds.version" in str(e) or "ProcedureNotFound" in str(e):
+                    logger.warning("GDS插件未安装，跳过PageRank计算")
+                    logger.info("如需PageRank功能，请安装GDS插件：https://neo4j.com/docs/graph-data-science/")
+                else:
+                    logger.warning(f"PageRank计算失败: {e}")
+
+        # 数据统计
+        total_entities = graph.run("MATCH (e:Entity) RETURN count(e) as count").evaluate()
+        entities_with_embedding = graph.run("""
+            MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN count(e) as count
+        """).evaluate()
+
+        logger.info(f"实体统计: 总数 {total_entities}, 包含向量 {entities_with_embedding}")
+        if total_entities > 0:
+            coverage = entities_with_embedding / total_entities * 100
+            logger.info(f"向量覆盖率: {coverage:.1f}%")
+
+        # 验证索引状态
+        index_status = graph.run(f"""
+            SHOW INDEXES WHERE name = '{entity_index_name}'
+        """).to_data_frame()
+
+        if not index_status.empty:
+            state = index_status.iloc[0]['state']
+            population = index_status.iloc[0]['populationPercent']
+            logger.info(f"索引状态: {state}, 构建进度: {population}%")
+        else:
+            logger.error("索引未找到或创建失败")
+            return False
+
+        logger.info("=" * 60)
+        logger.info("向量索引创建完成！")
+        logger.info("=" * 60)
+        logger.info("使用方法:")
+        logger.info("  1. 向量搜索：调用 find_similar_entities() 进行相似度搜索")
+        logger.info("  2. 重排序：设置 rerank='degree' 或 rerank='pagerank' 进行重排序")
+        logger.info("=" * 60)
+
+        return True
+
+    except Exception as e:
+        logger.error(f"向量索引创建失败: {e}")
+        logger.info("故障排除:")
+        logger.info("  1. 检查Neo4j版本 (需要 5.x 支持 Vector Index)")
+        logger.info("  2. 确认数据库中有包含 embedding 字段的 Entity")
+        logger.info("  3. 验证向量维度设置正确")
+        logger.info("  4. 检查用户权限 (需要 CREATE INDEX 权限)")
+        logger.info("=" * 60)
+        return False
+
+
 def collect_merged_entities_from_results(chunk_results: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     从分块处理结果中收集所有合并后的实体
@@ -3768,48 +3953,37 @@ def collect_merged_relations_from_results(relation_chunk_results: Dict[Tuple[str
     return merged_relations
 
 
-async def test_save_to_neo4j():
+async def save_to_neo4j_only(
+    data_dir: str = "./merged_data",
+    clear_existing: bool = True,
+    create_indexes: bool = True
+):
     """
-    测试函数：从merged_data目录读取实体和关系，直接存储到Neo4j
+    从merged_data目录读取实体和关系，直接存储到Neo4j
+    这是独立的保存功能，不进行实体合并，只负责数据导入和索引创建
 
-    用途：
-    1. 测试save_to_neo4j函数性能
-    2. 快速将已处理的数据导入Neo4j（无需重新运行实体合并）
-
-    使用方式：
-    python entity_merge.py --test
+    Args:
+        data_dir: 数据目录路径
+        clear_existing: 是否清空现有数据
+        create_indexes: 是否创建向量索引
     """
-    import argparse
+    logger.info("=== 独立保存模式：直接从文件读取数据并存储到Neo4j ===")
 
-    # 设置命令行参数
-    parser = argparse.ArgumentParser(description="测试Neo4j存储功能")
-    parser.add_argument("--test", action="store_true", help="运行测试模式")
-    parser.add_argument("--data-dir", default="./merged_data", help="数据目录路径")
-    parser.add_argument("--clear", default="true", help="是否清空现有数据 (true/false)")
-    args = parser.parse_args()
-
-    if not args.test:
-        print("使用 --test 参数运行测试模式")
-        print("示例：python entity_merge.py --test --data-dir ./merged_data --clear true")
-        return
-
-    logger.info("=== 测试模式：从文件读取数据并存储到Neo4j ===")
-
-    entities_file = os.path.join(args.data_dir, "processed_entities.json")
-    relations_file = os.path.join(args.data_dir, "processed_relations.json")
+    entities_file = os.path.join(data_dir, "processed_entities.json")
+    relations_file = os.path.join(data_dir, "processed_relations.json")
 
     # 检查文件是否存在
     if not os.path.exists(entities_file):
         logger.error(f"实体文件不存在: {entities_file}")
-        logger.info("请先运行完整的实体合并流程生成数据")
-        return
+        logger.info("请确认已运行完整的实体合并流程生成数据")
+        return False
 
     if not os.path.exists(relations_file):
         logger.warning(f"关系文件不存在: {relations_file}")
         logger.info("将只导入实体数据")
 
     # 读取数据
-    logger.info(f"从 {args.data_dir} 读取数据...")
+    logger.info(f"从 {data_dir} 读取数据...")
     with open(entities_file, 'r', encoding='utf-8') as f:
         merged_entities = json.load(f)
 
@@ -3831,8 +4005,6 @@ async def test_save_to_neo4j():
     logger.info(f"读取完成: {len(merged_entities)} 个实体, {len(merged_relations)} 个关系")
 
     # 调用save_to_neo4j
-    clear_existing = args.clear.lower() == "true"
-
     logger.info(f"开始存储到Neo4j，清空模式: {clear_existing}")
     neo4j_stats = await save_to_neo4j(
         merged_entities=merged_entities,
@@ -3840,31 +4012,56 @@ async def test_save_to_neo4j():
         clear_existing=clear_existing
     )
 
+    # 创建向量索引
+    if create_indexes:
+        logger.info("创建Neo4j向量索引...")
+        try:
+            create_neo4j_vector_indexes()
+            logger.info("✅ 向量索引创建完成")
+        except Exception as e:
+            logger.error(f"❌ 向量索引创建失败: {e}")
+
     # 打印结果
-    print("\n" + "="*60)
-    print("测试完成！")
-    print("="*60)
-    print(f"数据源: {args.data_dir}")
-    print(f"Neo4j实体: {neo4j_stats['entities_upserted']}")
-    print(f"Neo4j关系: {neo4j_stats['relations_upserted']}")
-    print(f"失败: {neo4j_stats['entities_failed'] + neo4j_stats['relations_failed']}")
-    print("="*60)
+    logger.info("="*60)
+    logger.info("独立保存完成！")
+    logger.info("="*60)
+    logger.info(f"数据源: {data_dir}")
+    logger.info(f"Neo4j实体: {neo4j_stats['entities_upserted']}")
+    logger.info(f"Neo4j关系: {neo4j_stats['relations_upserted']}")
+    logger.info(f"失败: {neo4j_stats['entities_failed'] + neo4j_stats['relations_failed']}")
+    logger.info("="*60)
+
+    return True
 
 
 if __name__ == "__main__":
     # 导入LLM使用跟踪器
     from llm_tracker import init_tracker, cleanup
+    import argparse
 
     # 初始化tracker（根据环境变量 ENABLE_LLM_TRACKING 控制）
     init_tracker()
 
     try:
-        # 检查是否运行测试模式
-        import sys
-        if "--save" in sys.argv:
-            asyncio.run(test_save_to_neo4j())
+        # 解析命令行参数
+        parser = argparse.ArgumentParser(description="实体合并和Neo4j存储工具")
+        parser.add_argument("--save", action="store_true", help="独立保存模式：从merged_data读取数据并存储到Neo4j")
+        parser.add_argument("--data-dir", default="./merged_data", help="数据目录路径 (默认: ./merged_data)")
+        parser.add_argument("--clear", default="true", help="是否清空现有数据 (true/false，默认: true)")
+        parser.add_argument("--no-index", action="store_true", help="不创建向量索引")
+        args = parser.parse_args()
+
+        if args.save:
+            # 独立保存模式
+            clear_existing = args.clear.lower() == "true"
+            create_indexes = not args.no_index
+            asyncio.run(save_to_neo4j_only(
+                data_dir=args.data_dir,
+                clear_existing=clear_existing,
+                create_indexes=create_indexes
+            ))
         else:
-            # 运行数据接管
+            # 运行完整的实体合并流程
             asyncio.run(main())
     finally:
         # 程序结束时自动打印报告并卸载tracker
