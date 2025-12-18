@@ -136,10 +136,13 @@ class KGQueryService:
     """Neo4j 知识图谱查询服务核心类"""
 
     def __init__(self):
-        self.kg_engine = None
+        self.connections = []  # 连接池
+        self.kg_engines = []  # 引擎池（每个连接对应一个引擎）
+        self.current_index = 0
+        self.lock = asyncio.Lock()
+        self.pool_size = int(os.getenv("NEO4J_POOL_SIZE", "5"))
         self.initialized = False
-        self.neo4j_graph = None
-        logger.info("[OK] KGQueryService initialized successfully")
+        logger.info(f"[OK] KGQueryService initialized (pool_size={self.pool_size})")
 
     async def initialize(
         self,
@@ -171,33 +174,39 @@ class KGQueryService:
             user = neo4j_user or os.getenv("NEO4J_USERNAME", "neo4j")
             password = neo4j_password or os.getenv("NEO4J_PASSWORD", "password")
 
-            logger.info(f"[INFO] Initializing Neo4j connection...")
+            logger.info(f"[INFO] Initializing Neo4j connection pool...")
             logger.info(f"  URI: {uri}")
             logger.info(f"  User: {user}")
+            logger.info(f"  Pool size: {self.pool_size}")
             logger.info(f"  Default limit: {default_limit}")
             logger.info(f"  Default timeout: {default_timeout}s")
             logger.info(f"  Vector search: {'[ENABLED]' if embedding_func else '[DISABLED]'}")
 
-            # 创建 Neo4j Graph 连接
-            self.neo4j_graph = Graph(
-                uri,
-                auth=(user, password)
-            )
+            # 创建连接池
+            for i in range(self.pool_size):
+                try:
+                    graph = Graph(uri, auth=(user, password))
+                    # 测试连接
+                    graph.run("RETURN 1").evaluate()
+                    self.connections.append(graph)
+                    logger.info(f"[OK] Connection {i+1}/{self.pool_size} established")
+                except Exception as e:
+                    logger.error(f"[ERROR] Failed to establish connection {i+1}: {e}")
+                    raise
 
-            # 测试连接
-            self.neo4j_graph.run("RETURN 1").evaluate()
-            logger.info("[OK] Neo4j connection successful")
-
-            # 创建 KG Query Engine
-            self.kg_engine = KGQueryEngine(
-                neo4j_graph=self.neo4j_graph,
-                default_limit=default_limit,
-                default_timeout=default_timeout,
-                embedding_func=embedding_func,
-            )
+            # 为每个连接创建 KG Query Engine
+            for i, graph in enumerate(self.connections):
+                engine = KGQueryEngine(
+                    neo4j_graph=graph,
+                    default_limit=default_limit,
+                    default_timeout=default_timeout,
+                    embedding_func=embedding_func,
+                )
+                self.kg_engines.append(engine)
+                logger.info(f"[OK] Engine {i+1}/{self.pool_size} initialized")
 
             self.initialized = True
-            logger.info("[OK] KGQueryEngine initialized successfully")
+            logger.info(f"[OK] KGQueryEngine pool initialized successfully (pool_size={self.pool_size})")
 
         except Exception as e:
             logger.error(f"[ERROR] KGQueryEngine initialization failed: {e}")
@@ -227,12 +236,17 @@ class KGQueryService:
             logger.info("服务初始化")
             await self.initialize()
 
+        # 获取连接池中的引擎（轮询）
+        async with self.lock:
+            kg_engine = self.kg_engines[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.kg_engines)
+
         # 计算实际向量检索的top_k
         vector_top_k = top_k * 4 if rerank == "degree" else top_k
         logger.info(f"[INFO] Finding similar entities: '{entity_query}' (top_k={top_k}, rerank={rerank}, vector_top_k={vector_top_k})")
 
         try:
-            results = await self.kg_engine.find_similar_entities(
+            results = await kg_engine.find_similar_entities(
                 entity_query=entity_query,
                 top_k=vector_top_k,
             )
@@ -291,6 +305,11 @@ class KGQueryService:
         # 提取候选节点ID列表
         candidate_ids = [c["entity_name"] for c in candidates]
 
+        # 获取连接池中的引擎（轮询）
+        async with self.lock:
+            kg_engine = self.kg_engines[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.kg_engines)
+
         # 构建子图并计算度数
         query = """
         UNWIND $candidate_ids as target_id
@@ -305,7 +324,7 @@ class KGQueryService:
         ORDER BY degree DESC
         """
 
-        degree_results = await self.kg_engine.execute_cypher(
+        degree_results = await kg_engine.execute_cypher(
             query=query,
             parameters={"candidate_ids": candidate_ids}
         )
@@ -368,6 +387,11 @@ class KGQueryService:
         candidate_ids = [c["entity_name"] for c in candidates]
 
         try:
+            # 获取连接池中的引擎（轮询）
+            async with self.lock:
+                kg_engine = self.kg_engines[self.current_index]
+                self.current_index = (self.current_index + 1) % len(self.kg_engines)
+
             # 直接查询候选实体的 PageRank 值（已预先计算并存储在节点属性中）
             query = """
             MATCH (e:Entity)
@@ -376,7 +400,7 @@ class KGQueryService:
             ORDER BY e.pagerank DESC
             """
 
-            pagerank_results = await self.kg_engine.execute_cypher(
+            pagerank_results = await kg_engine.execute_cypher(
                 query=query,
                 parameters={"candidate_ids": candidate_ids}
             )
@@ -441,13 +465,18 @@ class KGQueryService:
         if not self.initialized:
             await self.initialize()
 
+        # 获取连接池中的引擎（轮询）
+        async with self.lock:
+            kg_engine = self.kg_engines[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.kg_engines)
+
         logger.info(f"[INFO] Executing custom Cypher query")
         logger.info(f"  Query length: {len(query)} characters")
         logger.info(f"  Parameters count: {len(parameters) if parameters else 0}")
         logger.info(f"  Vector parameters: {list(vector_params.keys()) if vector_params else 'none'}")
 
         try:
-            results = await self.kg_engine.execute_cypher(
+            results = await kg_engine.execute_cypher(
                 query=query,
                 parameters=parameters,
                 limit=limit,
@@ -479,6 +508,11 @@ class KGQueryService:
         if not self.initialized:
             await self.initialize()
 
+        # 获取连接池中的引擎（轮询）
+        async with self.lock:
+            kg_engine = self.kg_engines[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.kg_engines)
+
         logger.info(f"[INFO] Getting chunks for entity: '{entity_id}' (include_content={include_content})")
 
         try:
@@ -489,7 +523,7 @@ class KGQueryService:
             LIMIT 1
             """
 
-            results = await self.kg_engine.execute_cypher(
+            results = await kg_engine.execute_cypher(
                 query=cypher,
                 parameters={"entity_id": entity_id},
                 limit=1
