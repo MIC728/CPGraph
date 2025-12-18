@@ -2,7 +2,6 @@
 MCP Server for Neo4j Knowledge Graph Query Engine
 
 基于 FastMCP 的知识图谱查询服务，使用 Neo4j 数据库和 Cypher 查询。
-使用官方 neo4j-python-driver 异步 API 实现真正的并发查询。
 参考 https://gofastmcp.com 了解更多信息。
 """
 
