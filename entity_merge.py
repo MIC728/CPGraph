@@ -3192,10 +3192,6 @@ def process_relation_chunk_sync(chunk_key: Tuple[str, str], relations: List[Dict
 async def main():
     """
     主函数 - 从新架构输出加载数据并进行实体合并
-
-    使用方式：
-    1. 先运行 new_test.py 生成数据到 ./new_rag_storage/
-    2. 再运行本文件进行实体合并
     """
     from dotenv import load_dotenv
     from lightrag.llm.openai import openai_complete_if_cache, openai_embed
@@ -4052,8 +4048,10 @@ if __name__ == "__main__":
         args = parser.parse_args()
 
         if args.save:
-            # 独立保存模式
-            clear_existing = args.clear.lower() == "true"
+            # 独立保存模式：优先从环境变量读取配置
+            clear_existing = os.getenv("CLEAR_NEO4J", args.clear.lower() == "true")
+            if isinstance(clear_existing, str):
+                clear_existing = clear_existing.lower() == "true"
             create_indexes = not args.no_index
             asyncio.run(save_to_neo4j_only(
                 data_dir=args.data_dir,

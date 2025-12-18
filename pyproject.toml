@@ -65,7 +65,7 @@ dependencies = [
     "propcache==0.4.1",
     "py-key-value-aio==0.3.0",
     "py-key-value-shared==0.3.0",
-    "py2neo>=2021.2.4",
+    "neo4j>=5.0",
     "pyasn1==0.6.1",
     "pyasn1-modules==0.4.2",
     "pycparser==2.23 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'",

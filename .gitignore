@@ -1,18 +1,73 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+*.pyo
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+.tox/
+.mypy_cache/
+.pytest_cache/
 
 # Virtual environments
 .venv
+.venv/
+venv/
+ENV/
+env/
 
+# Environment configuration
 .env
-*.log
+.env.local
+.env.*.local
 
+# IDE and editor files
 .idea/
-.claude/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+logs/
+
+# Data directories (adjust based on your needs)
+# Uncomment if you want to ignore generated data
+# kg_storage/
+# merged_data/
+# extracted_data/
+
+# Test coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Package files
+*.deb
+*.rpm
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# OS generated files
+nul
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 
 *.json

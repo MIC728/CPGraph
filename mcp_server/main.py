@@ -2,6 +2,7 @@
 MCP Server for Neo4j Knowledge Graph Query Engine
 
 基于 FastMCP 的知识图谱查询服务，使用 Neo4j 数据库和 Cypher 查询。
+使用官方 neo4j-python-driver 异步 API 实现真正的并发查询。
 参考 https://gofastmcp.com 了解更多信息。
 """
 
@@ -13,8 +14,8 @@ from typing import List, Dict, Any, Optional
 from fastmcp import FastMCP
 from kg_query_engine import KGQueryEngine
 
-# Neo4j 相关导入
-from py2neo import Graph
+# Neo4j 相关导入 - 使用官方异步驱动
+from neo4j import AsyncGraphDatabase
 from dotenv import load_dotenv
 import pathlib
 from lightrag.utils import setup_logger, get_env_value
@@ -133,16 +134,13 @@ mcp = FastMCP(
 )
 
 class KGQueryService:
-    """Neo4j 知识图谱查询服务核心类"""
+    """Neo4j 知识图谱查询服务核心类 - 使用官方异步驱动"""
 
     def __init__(self):
-        self.connections = []  # 连接池
-        self.kg_engines = []  # 引擎池（每个连接对应一个引擎）
-        self.current_index = 0
-        self.lock = asyncio.Lock()
-        self.pool_size = int(os.getenv("NEO4J_POOL_SIZE", "5"))
+        self.driver = None  # AsyncDriver 实例（内置连接池）
+        self.kg_engine = None  # 单个引擎实例
         self.initialized = False
-        logger.info(f"[OK] KGQueryService initialized (pool_size={self.pool_size})")
+        logger.info(f"[OK] KGQueryService initialized")
 
     async def initialize(
         self,
@@ -150,7 +148,6 @@ class KGQueryService:
         neo4j_user: Optional[str] = None,
         neo4j_password: Optional[str] = None,
         default_limit: int = 30,
-        default_timeout: int = 10,
         embedding_func=None,
     ):
         """
@@ -160,8 +157,7 @@ class KGQueryService:
             neo4j_uri: Neo4j 连接 URI
             neo4j_user: Neo4j 用户名
             neo4j_password: Neo4j 密码
-            default_limit: 默认查询限制
-            default_timeout: 默认超时时间（秒）
+            default_limit: 默认查询限制 (max 30)
             embedding_func: 嵌入函数，用于向量搜索
         """
         if self.initialized:
@@ -174,43 +170,39 @@ class KGQueryService:
             user = neo4j_user or os.getenv("NEO4J_USERNAME", "neo4j")
             password = neo4j_password or os.getenv("NEO4J_PASSWORD", "password")
 
-            logger.info(f"[INFO] Initializing Neo4j connection pool...")
+            logger.info(f"[INFO] Initializing Neo4j AsyncDriver...")
             logger.info(f"  URI: {uri}")
             logger.info(f"  User: {user}")
-            logger.info(f"  Pool size: {self.pool_size}")
             logger.info(f"  Default limit: {default_limit}")
-            logger.info(f"  Default timeout: {default_timeout}s")
             logger.info(f"  Vector search: {'[ENABLED]' if embedding_func else '[DISABLED]'}")
 
-            # 创建连接池
-            for i in range(self.pool_size):
-                try:
-                    graph = Graph(uri, auth=(user, password))
-                    # 测试连接
-                    graph.run("RETURN 1").evaluate()
-                    self.connections.append(graph)
-                    logger.info(f"[OK] Connection {i+1}/{self.pool_size} established")
-                except Exception as e:
-                    logger.error(f"[ERROR] Failed to establish connection {i+1}: {e}")
-                    raise
+            # 创建 AsyncDriver（内置连接池管理）
+            self.driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
 
-            # 为每个连接创建 KG Query Engine
-            for i, graph in enumerate(self.connections):
-                engine = KGQueryEngine(
-                    neo4j_graph=graph,
-                    default_limit=default_limit,
-                    default_timeout=default_timeout,
-                    embedding_func=embedding_func,
-                )
-                self.kg_engines.append(engine)
-                logger.info(f"[OK] Engine {i+1}/{self.pool_size} initialized")
+            # 验证连接
+            await self.driver.verify_connectivity()
+            logger.info(f"[OK] Neo4j connection verified")
+
+            # 创建单个引擎实例
+            self.kg_engine = KGQueryEngine(
+                driver=self.driver,
+                default_limit=default_limit,
+                embedding_func=embedding_func,
+            )
+            logger.info(f"[OK] KGQueryEngine initialized")
 
             self.initialized = True
-            logger.info(f"[OK] KGQueryEngine pool initialized successfully (pool_size={self.pool_size})")
+            logger.info(f"[OK] KGQueryService initialized successfully (async driver with built-in connection pool)")
 
         except Exception as e:
             logger.error(f"[ERROR] KGQueryEngine initialization failed: {e}")
             raise
+
+    async def cleanup(self):
+        """清理资源，关闭驱动连接"""
+        if self.driver:
+            await self.driver.close()
+            logger.info("[OK] Neo4j driver closed")
 
     async def find_similar_entities(
         self,
@@ -236,17 +228,12 @@ class KGQueryService:
             logger.info("服务初始化")
             await self.initialize()
 
-        # 获取连接池中的引擎（轮询）
-        async with self.lock:
-            kg_engine = self.kg_engines[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.kg_engines)
-
         # 计算实际向量检索的top_k
         vector_top_k = top_k * 4 if rerank == "degree" else top_k
         logger.info(f"[INFO] Finding similar entities: '{entity_query}' (top_k={top_k}, rerank={rerank}, vector_top_k={vector_top_k})")
 
         try:
-            results = await kg_engine.find_similar_entities(
+            results = await self.kg_engine.find_similar_entities(
                 entity_query=entity_query,
                 top_k=vector_top_k,
             )
@@ -305,11 +292,6 @@ class KGQueryService:
         # 提取候选节点ID列表
         candidate_ids = [c["entity_name"] for c in candidates]
 
-        # 获取连接池中的引擎（轮询）
-        async with self.lock:
-            kg_engine = self.kg_engines[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.kg_engines)
-
         # 构建子图并计算度数
         query = """
         UNWIND $candidate_ids as target_id
@@ -324,7 +306,7 @@ class KGQueryService:
         ORDER BY degree DESC
         """
 
-        degree_results = await kg_engine.execute_cypher(
+        degree_results = await self.kg_engine.execute_cypher(
             query=query,
             parameters={"candidate_ids": candidate_ids}
         )
@@ -387,11 +369,6 @@ class KGQueryService:
         candidate_ids = [c["entity_name"] for c in candidates]
 
         try:
-            # 获取连接池中的引擎（轮询）
-            async with self.lock:
-                kg_engine = self.kg_engines[self.current_index]
-                self.current_index = (self.current_index + 1) % len(self.kg_engines)
-
             # 直接查询候选实体的 PageRank 值（已预先计算并存储在节点属性中）
             query = """
             MATCH (e:Entity)
@@ -400,7 +377,7 @@ class KGQueryService:
             ORDER BY e.pagerank DESC
             """
 
-            pagerank_results = await kg_engine.execute_cypher(
+            pagerank_results = await self.kg_engine.execute_cypher(
                 query=query,
                 parameters={"candidate_ids": candidate_ids}
             )
@@ -446,7 +423,6 @@ class KGQueryService:
         query: str,
         parameters: Optional[Dict[str, Any]] = None,
         limit: Optional[int] = None,
-        timeout: Optional[int] = None,
         vector_params: Optional[Dict[str, bool]] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -455,8 +431,7 @@ class KGQueryService:
         Args:
             query: Cypher 查询字符串
             parameters: 查询参数
-            limit: 结果限制
-            timeout: 超时时间（秒）
+            limit: 结果限制 (max 30)
             vector_params: 向量参数映射，标记哪些参数需要转换为向量
 
         Returns:
@@ -465,22 +440,16 @@ class KGQueryService:
         if not self.initialized:
             await self.initialize()
 
-        # 获取连接池中的引擎（轮询）
-        async with self.lock:
-            kg_engine = self.kg_engines[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.kg_engines)
-
         logger.info(f"[INFO] Executing custom Cypher query")
         logger.info(f"  Query length: {len(query)} characters")
         logger.info(f"  Parameters count: {len(parameters) if parameters else 0}")
         logger.info(f"  Vector parameters: {list(vector_params.keys()) if vector_params else 'none'}")
 
         try:
-            results = await kg_engine.execute_cypher(
+            results = await self.kg_engine.execute_cypher(
                 query=query,
                 parameters=parameters,
                 limit=limit,
-                timeout=timeout,
                 vector_params=vector_params,
             )
             logger.info(f"[OK] Query successful, returned {len(results)} records")
@@ -508,11 +477,6 @@ class KGQueryService:
         if not self.initialized:
             await self.initialize()
 
-        # 获取连接池中的引擎（轮询）
-        async with self.lock:
-            kg_engine = self.kg_engines[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.kg_engines)
-
         logger.info(f"[INFO] Getting chunks for entity: '{entity_id}' (include_content={include_content})")
 
         try:
@@ -523,7 +487,7 @@ class KGQueryService:
             LIMIT 1
             """
 
-            results = await kg_engine.execute_cypher(
+            results = await self.kg_engine.execute_cypher(
                 query=cypher,
                 parameters={"entity_id": entity_id},
                 limit=1
@@ -710,13 +674,12 @@ async def find_similar_entities(
 - parameters: object (必需) - 查询参数字典
 - vector_params: object (必需) - 向量参数映射，标记哪些参数需要转换为向量进行模糊搜索。true代表嵌入成向量，false代表精确匹配
   例: {"query_vector": true} 表示将 parameters.query_vector 的字符串转换为向量
-- limit: integer (可选) - 结果数量限制，范围 1-100，超出范围将自动调整为安全值
-- timeout: integer (可选) - 查询超时时间（秒），范围 1-30，超出范围将自动调整为安全值
+- limit: integer (可选) - 结果数量限制，范围 1-30，超出范围将自动调整为安全值
 
 ⚠️ 安全控制:
-- 系统会自动验证 limit 和 timeout 参数，防止 DoS 攻击
+- 系统会自动验证 limit 参数，防止 DoS 攻击
 - 如果传入负数、零或 None，将使用安全默认值
-- 如果超出最大值，将被强制限制为最大值
+- 如果超出最大值（30），将被强制限制为最大值
 
 返回格式:
 JSON数组，每行包含查询结果记录
@@ -874,7 +837,6 @@ async def execute_custom_cypher(
     query: str,
     parameters: Optional[Dict[str, Any]] = None,
     limit: Optional[int] = None,
-    timeout: Optional[int] = None,
     vector_params: Optional[Dict[str, bool]] = None,
 ) -> List[Dict[str, Any]]:
     """执行自定义 Cypher 查询"""
@@ -885,7 +847,6 @@ async def execute_custom_cypher(
         query=query,
         parameters=parameters,
         limit=limit,
-        timeout=timeout,
         vector_params=vector_params,
     )
 
@@ -990,10 +951,12 @@ if __name__ == "__main__":
 
     asyncio.run(init_service())
     import asyncio
+    # 从环境变量读取MCP端口配置
+    mcp_port = int(os.getenv("MCP_PORT", "8000"))
     asyncio.run(mcp.run_async(
             transport="streamable-http",
             host="127.0.0.1",
-            port=8000,
+            port=mcp_port,
             log_level="debug",
             stateless_http=True
         ))

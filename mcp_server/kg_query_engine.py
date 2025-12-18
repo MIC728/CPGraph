@@ -3,13 +3,15 @@ Neo4j-based Knowledge Graph Query Engine for MCP Service
 
 A minimal interface for querying the Neo4j knowledge graph using Cypher queries.
 Focuses on security, parameterization, and query control.
+
+Uses official neo4j-python-driver with async API for true concurrent execution.
 """
 
 import time
 import re
 from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass
-from py2neo import Graph
+from neo4j import AsyncDriver
 from lightrag.utils import logger
 
 
@@ -36,23 +38,20 @@ class KGQueryEngine:
 
     def __init__(
         self,
-        neo4j_graph: Graph,
-        default_limit: int = 100,
-        default_timeout: int = 30,
+        driver: AsyncDriver,
+        default_limit: int = 30,
         embedding_func=None,
     ):
         """
         Initialize the Neo4j KG Query Engine
 
         Args:
-            neo4j_graph: Neo4j Graph instance (py2neo.Graph)
-            default_limit: Default LIMIT for queries
-            default_timeout: Default timeout in seconds
+            driver: Neo4j AsyncDriver instance
+            default_limit: Default LIMIT for queries (max 30)
             embedding_func: Embedding function for generating query vectors
         """
-        self.graph = neo4j_graph
+        self.driver = driver
         self.default_limit = default_limit
-        self.default_timeout = default_timeout
         self.embedding_func = embedding_func
         self._forbidden_keywords = [
             'CREATE', 'DELETE', 'SET', 'REMOVE',
@@ -285,7 +284,6 @@ class KGQueryEngine:
         query: str,
         parameters: Optional[Dict[str, Any]] = None,
         limit: Optional[int] = None,
-        timeout: Optional[int] = None,
         vector_params: Optional[Dict[str, bool]] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -294,8 +292,7 @@ class KGQueryEngine:
         Args:
             query: Cypher query string (can contain $param placeholders)
             parameters: Dictionary of query parameters
-            limit: Maximum number of results to return
-            timeout: Query timeout in seconds
+            limit: Maximum number of results to return (max 30)
             vector_params: Dict mapping parameter names to boolean flags indicating
                           whether to convert the parameter to a vector (True) or keep as is (False)
 
@@ -308,8 +305,7 @@ class KGQueryEngine:
         """
         if limit is None or limit <= 0 or limit > self.default_limit:
             limit = self.default_limit
-        if timeout is None or timeout <= 0 or timeout > self.default_timeout:
-            timeout = self.default_timeout
+
         # Validate query
         is_valid, error_msg = self.validate_cypher_query(query)
         if not is_valid:
@@ -341,41 +337,33 @@ class KGQueryEngine:
         if limit is not None:
             query = self.apply_query_limits(query, limit)
 
-        # Set timeout
-        if timeout is None:
-            timeout = self.default_timeout
-
         start_time = time.time()
 
         try:
-            logger.info(f"Executing Cypher query (timeout={timeout}s, limit={limit or self.default_limit})")
+            logger.info(f"Executing Cypher query (limit={limit or self.default_limit})")
             logger.debug(f"Query: {query}")
             logger.debug(f"Parameters: {parameters}")
 
-            # Execute query with timeout
-            result = self.graph.run(query, parameters, timeout=timeout * 1000)
+            # Execute query using async session
+            async with self.driver.session() as session:
+                result = await session.run(query, parameters)
 
-            # Convert result to list of dictionaries and filter embedding fields
-            results = []
-            for record in result:
-                record_dict = {}
-                for key, value in record.items():
-                    # Convert Neo4j Node objects to Python dict
-                    if hasattr(value, 'keys') and hasattr(value, 'values'):
-                        node_dict = {}
-                        for node_key, node_value in value.items():
-                            # Recursively handle nested Node objects
-                            if hasattr(node_value, 'keys') and hasattr(node_value, 'values'):
-                                node_dict[node_key] = dict(node_value)
-                            else:
-                                node_dict[node_key] = node_value
-                        record_dict[key] = node_dict
-                    else:
-                        record_dict[key] = value
+                # Convert result to list of dictionaries and filter embedding fields
+                results = []
+                async for record in result:
+                    record_dict = {}
+                    for key in record.keys():
+                        value = record[key]
+                        # Convert Neo4j Node objects to Python dict
+                        if hasattr(value, 'items'):
+                            node_dict = dict(value)
+                            record_dict[key] = node_dict
+                        else:
+                            record_dict[key] = value
 
-                # Filter out embedding-related fields
-                record_dict = self._filter_embedding_fields(record_dict)
-                results.append(record_dict)
+                    # Filter out embedding-related fields
+                    record_dict = self._filter_embedding_fields(record_dict)
+                    results.append(record_dict)
 
             elapsed = time.time() - start_time
             logger.info(f"Query executed successfully in {elapsed:.2f}s, returned {len(results)} records")
@@ -576,14 +564,13 @@ class KGQueryEngine:
             Dictionary with health status information
         """
         try:
-            # Test connection with simple query
-            result = self.graph.run("RETURN 1 as test").evaluate()
+            # Test connection using verify_connectivity
+            await self.driver.verify_connectivity()
 
             return {
-                "status": "healthy" if result == 1 else "unhealthy",
+                "status": "healthy",
                 "neo4j_connected": True,
                 "default_limit": self.default_limit,
-                "default_timeout": self.default_timeout,
             }
 
         except Exception as e:
