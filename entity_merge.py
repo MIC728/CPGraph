@@ -3468,7 +3468,7 @@ async def save_to_neo4j(
     clear_existing: bool = True
 ) -> Dict[str, Any]:
     """
-    将合并后的实体和关系数据存入Neo4j（独立函数，不依赖LightRAG）
+    将合并后的实体和关系数据存入Neo4j（使用官方neo4j异步驱动）
 
     Args:
         merged_entities: 合并后的实体列表
@@ -3479,10 +3479,10 @@ async def save_to_neo4j(
     Returns:
         Dict[str, Any]: 操作结果统计
     """
-    from py2neo import Graph, Node, Relationship
+    from neo4j import AsyncGraphDatabase
     from dotenv import load_dotenv
 
-    logger.info("=== 开始执行 save_to_neo4j ===")
+    logger.info("=== 开始执行 save_to_neo4j (使用官方驱动) ===")
 
     stats = {
         "entities_upserted": 0,
@@ -3509,207 +3509,199 @@ async def save_to_neo4j(
     neo4j_user = os.getenv("NEO4J_USERNAME", "neo4j")
     neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
 
-    graph = Graph(neo4j_uri, auth=(neo4j_user, neo4j_password))
+    driver = AsyncGraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
-    # ==================== 清空Neo4j数据（如果需要） ====================
-    if clear_existing:
-        logger.warning("清空模式：将先删除所有Neo4j数据，再重新存入合并数据")
-        try:
-            # 使用显式事务确保清空操作可靠执行
-            tx = graph.begin()
-            result = tx.run("MATCH (n) DETACH DELETE n")
-            graph.commit(tx)
+    try:
+        # ==================== 清空Neo4j数据（如果需要） ====================
+        if clear_existing:
+            logger.warning("清空模式：将先删除所有Neo4j数据，再重新存入合并数据")
+            try:
+                async with driver.session() as session:
+                    result = await session.run("MATCH (n) DETACH DELETE n")
+                    await result.consume()
 
-            # 验证清空操作结果
-            stats["entities_cleared"] = len(merged_entities)
-            stats["relations_cleared"] = len(merged_relations)
-            logger.info("已清空所有Neo4j数据")
+                    # 验证清空操作结果
+                    stats["entities_cleared"] = len(merged_entities)
+                    stats["relations_cleared"] = len(merged_relations)
+                    logger.info("已清空所有Neo4j数据")
 
-            # 再次验证：检查是否还有剩余节点
-            remaining_count = graph.run("MATCH (n) RETURN count(n) as count").evaluate()
-            logger.info(f"清空后剩余节点数: {remaining_count}")
+                    # 再次验证：检查是否还有剩余节点
+                    result = await session.run("MATCH (n) RETURN count(n) as count")
+                    record = await result.single()
+                    remaining_count = record["count"]
+                    logger.info(f"清空后剩余节点数: {remaining_count}")
 
-        except Exception as e:
-            logger.error(f"清空Neo4j数据失败: {e}")
-            stats["errors"].append(f"清空Neo4j数据失败: {str(e)}")
+            except Exception as e:
+                logger.error(f"清空Neo4j数据失败: {e}")
+                stats["errors"].append(f"清空Neo4j数据失败: {str(e)}")
 
-    # ==================== 插入实体数据 ====================
-    logger.info("开始插入实体数据...")
+        # ==================== 插入实体数据 ====================
+        logger.info("开始插入实体数据...")
 
-    # 设置实体批处理大小（减小批次避免超时）
-    ENTITY_BATCH_SIZE = 500  # 从1000减少到500
-    entity_batches = [merged_entities[i:i + ENTITY_BATCH_SIZE]
-                      for i in range(0, len(merged_entities), ENTITY_BATCH_SIZE)]
+        # 设置实体批处理大小（减小批次避免超时）
+        ENTITY_BATCH_SIZE = 500
+        entity_batches = [merged_entities[i:i + ENTITY_BATCH_SIZE]
+                          for i in range(0, len(merged_entities), ENTITY_BATCH_SIZE)]
 
-    logger.info(f"实体总数: {len(merged_entities)}, 批次数: {len(entity_batches)}, 每批大小: {ENTITY_BATCH_SIZE}")
+        logger.info(f"实体总数: {len(merged_entities)}, 批次数: {len(entity_batches)}, 每批大小: {ENTITY_BATCH_SIZE}")
 
-    # 分批插入实体
-    for batch_idx, entity_batch in enumerate(entity_batches):
-        tx = graph.begin()
-        try:
-            for entity in entity_batch:
+        # 分批插入实体
+        for batch_idx, entity_batch in enumerate(entity_batches):
+            async with driver.session() as session:
                 try:
-                    entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
-                    if not entity_id:
-                        stats["entities_failed"] += 1
-                        continue
+                    for entity in entity_batch:
+                        try:
+                            entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
+                            if not entity_id:
+                                stats["entities_failed"] += 1
+                                continue
 
-                    # 使用py2neo创建节点
-                    node_props = {
-                        "entity_id": entity_id,
-                        "description": entity.get("description", ""),
-                        "source_id": entity.get("source_id", ""),
-                        "file_path": entity.get("file_path", ""),
-                        "created_at": entity.get("created_at", int(time.time()))
-                    }
+                            # 使用Cypher创建节点
+                            node_props = {
+                                "entity_id": entity_id,
+                                "description": entity.get("description", ""),
+                                "source_id": entity.get("source_id", ""),
+                                "file_path": entity.get("file_path", ""),
+                                "created_at": entity.get("created_at", int(time.time()))
+                            }
 
-                    # 添加嵌入向量（如果存在）
-                    if entity.get("embedding") is not None:
-                        node_props["embedding"] = entity["embedding"]
+                            # 添加嵌入向量（如果存在）
+                            if entity.get("embedding") is not None:
+                                node_props["embedding"] = entity["embedding"]
 
-                    # 解析entity_type_dim1（支持中英文逗号）
-                    dim1_str = entity.get("entity_type_dim1", "")
-                    dim1_labels = [k.strip() for k in dim1_str.replace('，', ',').split(',') if k.strip()]
-                    if not dim1_labels:
-                        dim1_labels = ["UNKNOWN"]
+                            # 解析entity_type_dim1（支持中英文逗号）
+                            dim1_str = entity.get("entity_type_dim1", "")
+                            dim1_labels = [k.strip() for k in dim1_str.replace('，', ',').split(',') if k.strip()]
+                            if not dim1_labels:
+                                dim1_labels = ["UNKNOWN"]
 
-                    # 解析entity_type_dim2（支持中英文逗号）
-                    dim2_str = entity.get("entity_type_dim2", "")
-                    dim2_labels = [k.strip() for k in dim2_str.replace('，', ',').split(',') if k.strip()]
-                    if not dim2_labels:
-                        dim2_labels = ["UNKNOWN"]
+                            # 解析entity_type_dim2（支持中英文逗号）
+                            dim2_str = entity.get("entity_type_dim2", "")
+                            dim2_labels = [k.strip() for k in dim2_str.replace('，', ',').split(',') if k.strip()]
+                            if not dim2_labels:
+                                dim2_labels = ["UNKNOWN"]
 
-                    # 合并所有标签
-                    type_labels = dim1_labels + dim2_labels
+                            # 合并所有标签
+                            type_labels = dim1_labels + dim2_labels
+                            labels_str = ":" + ":".join(type_labels)
 
-                    # 创建节点（使用所有标签）
-                    node = Node(
-                               "Entity",  # 通用标签，用于向量索引
-                               *type_labels,  # 解包所有标签
-                               **node_props)
-                    tx.create(node)
-                    stats["entities_upserted"] += 1
+                            # 构建Cypher查询
+                            query = f"""
+                            CREATE (n{labels_str} $props)
+                            """
+                            await session.run(query, props=node_props)
+                            stats["entities_upserted"] += 1
+
+                        except Exception as e:
+                            stats["entities_failed"] += 1
+                            stats["errors"].append(f"实体 {entity.get('entity_id', 'unknown')} 插入失败: {str(e)}")
+                            logger.error(f"插入实体失败: {e}")
+
+                    logger.info(f"批次 {batch_idx + 1}/{len(entity_batches)} 完成: {len(entity_batch)} 个实体, 累计: {stats['entities_upserted']}")
 
                 except Exception as e:
-                    stats["entities_failed"] += 1
-                    stats["errors"].append(f"实体 {entity.get('entity_id', 'unknown')} 插入失败: {str(e)}")
-                    logger.error(f"插入实体失败: {e}")
+                    stats["entities_failed"] += len(entity_batch)
+                    stats["errors"].append(f"实体批次 {batch_idx + 1} 插入失败: {str(e)}")
+                    logger.error(f"实体批次 {batch_idx + 1} 插入失败: {e}")
 
-            # 提交当前批次
-            graph.commit(tx)
-            logger.info(f"批次 {batch_idx + 1}/{len(entity_batches)} 完成: {len(entity_batch)} 个实体, 累计: {stats['entities_upserted']}")
+        logger.info(f"实体插入完成: 成功 {stats['entities_upserted']}, 失败 {stats['entities_failed']}")
 
-        except Exception as e:
-            # 回滚失败批次
-            graph.rollback(tx)
-            stats["entities_failed"] += len(entity_batch)
-            stats["errors"].append(f"实体批次 {batch_idx + 1} 插入失败: {str(e)}")
-            logger.error(f"实体批次 {batch_idx + 1} 插入失败: {e}")
+        # 调试：记录前10个实体ID用于对比
+        logger.info("前10个实体ID示例:")
+        for i, entity in enumerate(merged_entities[:10]):
+            entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
+            logger.info(f"  {i+1}. {entity_id}")
 
-    logger.info(f"实体插入完成: 成功 {stats['entities_upserted']}, 失败 {stats['entities_failed']}")
+        # ==================== 预构建节点映射 ====================
+        logger.info("预构建节点映射...")
+        entity_id_to_node = {}
+        async with driver.session() as session:
+            # 查询所有实体节点
+            result = await session.run("MATCH (n:Entity) RETURN n.entity_id as entity_id, id(n) as node_id")
+            async for record in result:
+                entity_id_to_node[record["entity_id"]] = record["node_id"]
 
-    # 调试：记录前10个实体ID用于对比
-    logger.info("前10个实体ID示例:")
-    for i, entity in enumerate(merged_entities[:10]):
-        entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
-        logger.info(f"  {i+1}. {entity_id}")
+        logger.info(f"节点映射完成: {len(entity_id_to_node)} 个节点")
 
-    # ==================== 预构建节点映射 ====================
-    logger.info("预构建节点映射...")
-    entity_id_to_node = {}
-    for entity in merged_entities:
-        entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
-        if not entity_id:
-            continue
-        # 查找节点
-        node = graph.nodes.match("Entity", entity_id=entity_id).first()
-        if node:
-            entity_id_to_node[entity_id] = node
+        # ==================== 插入关系数据 ====================
+        logger.info("开始插入关系数据...")
 
-    logger.info(f"节点映射完成: {len(entity_id_to_node)} 个节点")
+        BATCH_SIZE = 1000
+        relation_queries = []
+        self_loops_removed = 0
 
-    # ==================== 插入关系数据 ====================
-    logger.info("开始插入关系数据...")
+        for relation in merged_relations:
+            try:
+                src_id = relation.get("src_id")
+                tgt_id = relation.get("tgt_id")
 
-    BATCH_SIZE = 1000
-    current_batch = []
-    self_loops_removed = 0
+                if not src_id or not tgt_id:
+                    stats["relations_failed"] += 1
+                    continue
 
-    for relation in merged_relations:
-        try:
-            src_id = relation.get("src_id")
-            tgt_id = relation.get("tgt_id")
+                # 过滤自环关系
+                if src_id == tgt_id:
+                    self_loops_removed += 1
+                    stats["relations_self_loops_removed"] += 1
+                    logger.debug(f"跳过自环关系: {src_id} -> {tgt_id}")
+                    continue
 
-            if not src_id or not tgt_id:
+                # 检查节点是否存在
+                if src_id not in entity_id_to_node or tgt_id not in entity_id_to_node:
+                    stats["relations_failed"] += 1
+                    continue
+
+                # 清洗keywords
+                keywords_str = relation.get("keywords", "")
+                original_desc = relation.get("description", "")
+                keyword_labels, cleaned_desc = clean_relation_keywords(keywords_str, original_desc)
+                rel_type = keyword_labels[0] if keyword_labels else "RELATED_TO"
+
+                # 准备关系属性
+                rel_props = {
+                    "weight": float(relation.get("weight", 1.0)),
+                    "description": cleaned_desc,
+                    "keywords": ",".join(keyword_labels),
+                    "source_id": relation.get("source_chunk_id", ""),
+                    "file_path": relation.get("file_path", ""),
+                    "created_at": relation.get("created_at", int(time.time()))
+                }
+
+                # 构建Cypher查询
+                query = f"""
+                MATCH (a:Entity), (b:Entity)
+                WHERE a.entity_id = $src_id AND b.entity_id = $tgt_id
+                CREATE (a)-[r:{rel_type} $props]->(b)
+                """
+                relation_queries.append((query, {"src_id": src_id, "tgt_id": tgt_id, "props": rel_props}))
+
+            except Exception as e:
                 stats["relations_failed"] += 1
-                continue
+                logger.error(f"关系插入失败: {e}")
 
-            # 过滤自环关系
-            if src_id == tgt_id:
-                self_loops_removed += 1
-                stats["relations_self_loops_removed"] += 1
-                logger.debug(f"跳过自环关系: {src_id} -> {tgt_id}")
-                continue
-
-            # 从预构建映射中获取节点
-            src_node = entity_id_to_node.get(src_id)
-            tgt_node = entity_id_to_node.get(tgt_id)
-
-            if not src_node or not tgt_node:
-                stats["relations_failed"] += 1
-                continue
-
-            # 清洗keywords
-            keywords_str = relation.get("keywords", "")
-            original_desc = relation.get("description", "")
-            keyword_labels, cleaned_desc = clean_relation_keywords(keywords_str, original_desc)
-            rel_type = keyword_labels[0] if keyword_labels else "RELATED_TO"
-
-            # 创建关系
-            rel = Relationship(src_node, rel_type, tgt_node,
-                             weight=float(relation.get("weight", 1.0)),
-                             description=cleaned_desc,
-                             keywords=",".join(keyword_labels),
-                             keyword_labels=keyword_labels,
-                             source_id=relation.get("source_chunk_id", ""),
-                             file_path=relation.get("file_path", ""),
-                             created_at=relation.get("created_at", int(time.time())))
-
-            current_batch.append(rel)
-
-            # 达到批次大小时提交
-            if len(current_batch) >= BATCH_SIZE:
-                tx = graph.begin()
+        # 批量执行关系查询
+        for i in range(0, len(relation_queries), BATCH_SIZE):
+            batch = relation_queries[i:i + BATCH_SIZE]
+            async with driver.session() as session:
                 try:
-                    for rel in current_batch:
-                        tx.create(rel)
-                    graph.commit(tx)
-                    stats["relations_upserted"] += len(current_batch)
+                    for query, params in batch:
+                        await session.run(query, params)
+                        stats["relations_upserted"] += 1
+                    logger.info(f"关系批次 {i//BATCH_SIZE + 1} 完成: {len(batch)} 个关系")
                 except Exception as e:
-                    graph.rollback(tx)
-                    stats["relations_failed"] += len(current_batch)
+                    stats["relations_failed"] += len(batch)
                     logger.error(f"关系批次插入失败: {e}")
-                finally:
-                    current_batch = []
 
-        except Exception as e:
-            stats["relations_failed"] += 1
-            logger.error(f"关系插入失败: {e}")
+        logger.info(f"已创建 {stats['relations_upserted']} 个关系到Neo4j，已过滤 {self_loops_removed} 个自环关系")
 
-    # 处理剩余关系
-    if current_batch:
-        tx = graph.begin()
-        try:
-            for rel in current_batch:
-                tx.create(rel)
-            graph.commit(tx)
-            stats["relations_upserted"] += len(current_batch)
-        except Exception as e:
-            graph.rollback(tx)
-            stats["relations_failed"] += len(current_batch)
-            logger.error(f"最终关系批次插入失败: {e}")
+    except Exception as e:
+        logger.error(f"save_to_neo4j 执行失败: {e}")
+        stats["errors"].append(f"save_to_neo4j 执行失败: {str(e)}")
+        raise
 
-    logger.info(f"已创建 {stats['relations_upserted']} 个关系到Neo4j，已过滤 {self_loops_removed} 个自环关系")
+    finally:
+        if driver:
+            await driver.close()
 
     # ==================== 打印统计信息 ====================
     logger.info("="*60)
@@ -3731,7 +3723,7 @@ async def save_to_neo4j(
     return stats
 
 
-def create_neo4j_vector_indexes(
+async def create_neo4j_vector_indexes(
     embedding_dim: int = None,
     create_pagerank: bool = True
 ) -> bool:
@@ -3745,12 +3737,13 @@ def create_neo4j_vector_indexes(
     Returns:
         bool: 是否成功创建索引
     """
-    from py2neo import Graph
+    from neo4j import AsyncGraphDatabase
 
     logger.info("=" * 60)
     logger.info("创建Neo4j向量索引")
     logger.info("=" * 60)
 
+    driver = None
     try:
         # 读取配置
         uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -3762,124 +3755,146 @@ def create_neo4j_vector_indexes(
         logger.info(f"向量维度: {embedding_dim}")
 
         # 创建连接
-        graph = Graph(uri, auth=(user, password))
+        driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
 
         # 测试连接
-        result = graph.run("RETURN 1 as test").evaluate()
-        logger.info(f"连接测试成功: {result}")
+        await driver.verify_connectivity()
+        logger.info("连接测试成功")
 
-        # 检查现有索引
-        existing_indexes = graph.run("SHOW INDEXES").to_data_frame()
-        vector_indexes = existing_indexes[existing_indexes['type'] == 'VECTOR']
+        async with driver.session() as session:
+            # 检查现有索引
+            result = await session.run("SHOW INDEXES")
+            existing_indexes = []
+            async for record in result:
+                existing_indexes.append({
+                    'name': record['name'],
+                    'type': record.get('type', ''),
+                    'state': record.get('state', ''),
+                    'populationPercent': record.get('populationPercent', '')
+                })
 
-        if not vector_indexes.empty:
-            logger.info(f"发现 {len(vector_indexes)} 个现有向量索引")
+            vector_indexes = [idx for idx in existing_indexes if idx['type'] == 'VECTOR']
 
-        # 创建Entity向量索引
-        entity_index_name = "entity_embedding_index"
+            if vector_indexes:
+                logger.info(f"发现 {len(vector_indexes)} 个现有向量索引")
 
-        # 检查索引是否已存在
-        if entity_index_name in existing_indexes['name'].values:
-            logger.info(f"删除旧索引: {entity_index_name}")
-            graph.run(f"DROP INDEX {entity_index_name} IF EXISTS").evaluate()
+            # 创建Entity向量索引
+            entity_index_name = "entity_embedding_index"
 
-        # 创建新索引
-        graph.run(f"""
-            CREATE VECTOR INDEX {entity_index_name}
-            FOR (e:Entity) ON (e.embedding)
-            OPTIONS {{
-              indexConfig: {{
-                `vector.dimensions`: {embedding_dim},
-                `vector.similarity_function`: 'cosine'
-              }}
-            }}
-        """).evaluate()
+            # 检查索引是否已存在
+            index_exists = any(idx['name'] == entity_index_name for idx in existing_indexes)
+            if index_exists:
+                logger.info(f"删除旧索引: {entity_index_name}")
+                await session.run(f"DROP INDEX {entity_index_name} IF EXISTS")
 
-        logger.info(f"向量索引创建成功: {entity_index_name}")
+            # 创建新索引
+            await session.run(f"""
+                CREATE VECTOR INDEX {entity_index_name}
+                FOR (e:Entity) ON (e.embedding)
+                OPTIONS {{
+                  indexConfig: {{
+                    `vector.dimensions`: {embedding_dim},
+                    `vector.similarity_function`: 'cosine'
+                  }}
+                }}
+            """)
 
-        # 计算PageRank
-        if create_pagerank:
-            logger.info("计算全图PageRank...")
-            try:
-                # 检查GDS是否可用
-                gds_version = graph.run("RETURN gds.version()").evaluate()
-                logger.info(f"GDS版本: {gds_version}")
+            logger.info(f"向量索引创建成功: {entity_index_name}")
 
-                # 删除已存在的图投影（如果存在）
+            # 计算PageRank
+            if create_pagerank:
+                logger.info("计算全图PageRank...")
                 try:
-                    graph.run("CALL gds.graph.drop('entity_graph', false)").evaluate()
-                    logger.info("已删除旧的图投影 'entity_graph'")
-                except Exception:
-                    pass  # 图投影不存在，忽略
+                    # 检查GDS是否可用
+                    result = await session.run("RETURN gds.version() AS version")
+                    record = await result.single()
+                    gds_version = record['version']
+                    logger.info(f"GDS版本: {gds_version}")
 
-                # 创建图投影
-                graph.run("""
-                    CALL gds.graph.project(
-                        'entity_graph',
-                        'Entity',
-                        {
-                            RELATIONSHIP: {
-                                type: '*',
-                                orientation: 'UNDIRECTED'
+                    # 删除已存在的图投影（如果存在）
+                    try:
+                        await session.run("CALL gds.graph.drop('entity_graph', false)")
+                        logger.info("已删除旧的图投影 'entity_graph'")
+                    except Exception:
+                        pass  # 图投影不存在，忽略
+
+                    # 创建图投影
+                    await session.run("""
+                        CALL gds.graph.project(
+                            'entity_graph',
+                            'Entity',
+                            {
+                                RELATIONSHIP: {
+                                    type: '*',
+                                    orientation: 'UNDIRECTED'
+                                }
                             }
-                        }
-                    )
-                """).evaluate()
+                        )
+                    """)
 
-                # 运行PageRank算法
-                pagerank_result = graph.run("""
-                    CALL gds.pageRank.write('entity_graph', {
-                        writeProperty: 'pagerank',
-                        dampingFactor: 0.85,
-                        maxIterations: 40
-                    })
-                    YIELD nodePropertiesWritten
-                    RETURN nodePropertiesWritten
-                """).evaluate()
+                    # 运行PageRank算法
+                    result = await session.run("""
+                        CALL gds.pageRank.write('entity_graph', {
+                            writeProperty: 'pagerank',
+                            dampingFactor: 0.85,
+                            maxIterations: 40
+                        })
+                        YIELD nodePropertiesWritten
+                        RETURN nodePropertiesWritten
+                    """)
+                    record = await result.single()
+                    pagerank_result = record['nodePropertiesWritten']
 
-                logger.info(f"PageRank计算完成，写入 {pagerank_result} 个节点")
+                    logger.info(f"PageRank计算完成，写入 {pagerank_result} 个节点")
 
-                # 删除图投影
-                graph.run("CALL gds.graph.drop('entity_graph')").evaluate()
+                    # 删除图投影
+                    await session.run("CALL gds.graph.drop('entity_graph')")
 
-                # 创建PageRank索引
-                graph.run("""
-                    CREATE INDEX entity_pagerank_idx IF NOT EXISTS
-                    FOR (e:Entity) ON (e.pagerank)
-                """).evaluate()
+                    # 创建PageRank索引
+                    await session.run("""
+                        CREATE INDEX entity_pagerank_idx IF NOT EXISTS
+                        FOR (e:Entity) ON (e.pagerank)
+                    """)
 
-                logger.info("PageRank索引创建成功")
+                    logger.info("PageRank索引创建成功")
 
-            except Exception as e:
-                if "gds.version" in str(e) or "ProcedureNotFound" in str(e):
-                    logger.warning("GDS插件未安装，跳过PageRank计算")
-                    logger.info("如需PageRank功能，请安装GDS插件：https://neo4j.com/docs/graph-data-science/")
-                else:
-                    logger.warning(f"PageRank计算失败: {e}")
+                except Exception as e:
+                    if "gds.version" in str(e) or "ProcedureNotFound" in str(e):
+                        logger.warning("GDS插件未安装，跳过PageRank计算")
+                        logger.info("如需PageRank功能，请安装GDS插件：https://neo4j.com/docs/graph-data-science/")
+                    else:
+                        logger.warning(f"PageRank计算失败: {e}")
 
-        # 数据统计
-        total_entities = graph.run("MATCH (e:Entity) RETURN count(e) as count").evaluate()
-        entities_with_embedding = graph.run("""
-            MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN count(e) as count
-        """).evaluate()
+            # 数据统计
+            result = await session.run("MATCH (e:Entity) RETURN count(e) as count")
+            record = await result.single()
+            total_entities = record['count']
 
-        logger.info(f"实体统计: 总数 {total_entities}, 包含向量 {entities_with_embedding}")
-        if total_entities > 0:
-            coverage = entities_with_embedding / total_entities * 100
-            logger.info(f"向量覆盖率: {coverage:.1f}%")
+            result = await session.run("""
+                MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN count(e) as count
+            """)
+            record = await result.single()
+            entities_with_embedding = record['count']
 
-        # 验证索引状态
-        index_status = graph.run(f"""
-            SHOW INDEXES WHERE name = '{entity_index_name}'
-        """).to_data_frame()
+            logger.info(f"实体统计: 总数 {total_entities}, 包含向量 {entities_with_embedding}")
+            if total_entities > 0:
+                coverage = entities_with_embedding / total_entities * 100
+                logger.info(f"向量覆盖率: {coverage:.1f}%")
 
-        if not index_status.empty:
-            state = index_status.iloc[0]['state']
-            population = index_status.iloc[0]['populationPercent']
-            logger.info(f"索引状态: {state}, 构建进度: {population}%")
-        else:
-            logger.error("索引未找到或创建失败")
-            return False
+            # 验证索引状态
+            result = await session.run(f"""
+                SHOW INDEXES WHERE name = '{entity_index_name}'
+            """)
+            index_records = [record async for record in result]
+
+            if index_records:
+                index_info = index_records[0]
+                state = index_info.get('state', '')
+                population = index_info.get('populationPercent', '')
+                logger.info(f"索引状态: {state}, 构建进度: {population}%")
+            else:
+                logger.error("索引未找到或创建失败")
+                return False
 
         logger.info("=" * 60)
         logger.info("向量索引创建完成！")
@@ -3900,6 +3915,10 @@ def create_neo4j_vector_indexes(
         logger.info("  4. 检查用户权限 (需要 CREATE INDEX 权限)")
         logger.info("=" * 60)
         return False
+
+    finally:
+        if driver:
+            await driver.close()
 
 
 def collect_merged_entities_from_results(chunk_results: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:

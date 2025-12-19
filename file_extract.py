@@ -145,7 +145,7 @@ async def extract_and_extract(input_path: str, mode: str):
         )
     else:
         entities, relations = await extract_problems_async(
-            documents=texts,
+            documents=texts[:10],
             llm_func=llm_func,
             config=config
         )
