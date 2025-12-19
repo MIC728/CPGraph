@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "cpgraph"
 version = "0.1.0"
@@ -105,4 +109,9 @@ dependencies = [
     "websockets==15.0.1",
     "xlsxwriter==3.2.9",
     "yarl==1.22.0",
+    "openai>=2.14.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lightrag*"]
