@@ -11,7 +11,6 @@ import re
 from typing import List, Dict, Any, Optional, Tuple, Callable
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 # 加载环境变量
 from dotenv import load_dotenv
@@ -27,9 +26,7 @@ from lightrag.constants import (
 )
 
 # 导入LLM摘要服务
-from llm_summary_service import LLMSummaryService
-
-import sys
+from src.llm_summary_service import LLMSummaryService
 
 from lightrag.utils import setup_logger, get_env_value
 
@@ -798,7 +795,6 @@ def process_entity_chunk_with_dual_strategy(
     Returns:
         Dict[str, Any]: 处理结果
     """
-    import hnswlib
 
     config = config or DualStrategyMergeConfig()
 
@@ -1768,7 +1764,7 @@ def merge_entity_group(group: List[str], entities_dict: Dict[str, Dict[str, Any]
         # 大量描述使用LLM生成
         try:
             # 导入LLM摘要服务
-            from llm_summary_service import LLMSummaryService
+            from src.llm_summary_service import LLMSummaryService
             llm_service = LLMSummaryService()
 
             entity_name = primary_entity_id or f"Entity_{chunk_name}"
@@ -1917,7 +1913,7 @@ async def merge_entity_group_async(group: List[str], entities_dict: Dict[str, Di
         # 大量描述使用LLM生成
         try:
             # 导入LLM摘要服务
-            from llm_summary_service import LLMSummaryService
+            from src.llm_summary_service import LLMSummaryService
             llm_service = LLMSummaryService()
             
             entity_name = primary_entity_id or f"Entity_{chunk_name}"
@@ -4051,7 +4047,7 @@ async def save_to_neo4j_only(
 
 if __name__ == "__main__":
     # 导入LLM使用跟踪器
-    from llm_tracker import init_tracker, cleanup
+    from src.llm_tracker import init_tracker, cleanup
     import argparse
 
     # 初始化tracker（根据环境变量 ENABLE_LLM_TRACKING 控制）

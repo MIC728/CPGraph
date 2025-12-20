@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import List
 
-from multi_threaded_extractor import extract_documents_async, extract_problems_async, ExtractionConfig
+from src.multi_threaded_extractor import extract_documents_async, extract_problems_async, ExtractionConfig
 
 class FileExtractor:
     """CPGraph 文件提取器"""
@@ -199,7 +199,7 @@ async def main():
         return 1
 
 if __name__ == "__main__":
-    from llm_tracker import cleanup
+    from src.llm_tracker import cleanup
 
     try:
         exit_code = asyncio.run(main())

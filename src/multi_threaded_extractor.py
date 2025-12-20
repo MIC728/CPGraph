@@ -69,7 +69,7 @@ class ExtractionConfig:
     # 以避免分割题目和题解，保持实体的完整性
 
     # 输出参数
-    output_dir: str = "./extracted_data"
+    output_dir: str = "../extracted_data"
 
     # 性能调优
     enable_progress_logging: bool = True

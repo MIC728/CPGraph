@@ -11,7 +11,7 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 from fastmcp import FastMCP
-from kg_query_engine import KGQueryEngine
+from src.kg_query_engine import KGQueryEngine
 
 # Neo4j 相关导入 - 使用官方异步驱动
 from neo4j import AsyncGraphDatabase
