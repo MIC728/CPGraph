@@ -4061,12 +4061,35 @@ if __name__ == "__main__":
         # 解析命令行参数
         parser = argparse.ArgumentParser(description="实体合并和Neo4j存储工具")
         parser.add_argument("--save", action="store_true", help="独立保存模式：从merged_data读取数据并存储到Neo4j")
+        parser.add_argument("--index", action="store_true", help="仅创建向量索引模式：跳过保存到Neo4j，只创建向量索引")
         parser.add_argument("--data-dir", default="./merged_data", help="数据目录路径 (默认: ./merged_data)")
         parser.add_argument("--clear", default="true", help="是否清空现有数据 (true/false，默认: true)")
         parser.add_argument("--no-index", action="store_true", help="不创建向量索引")
         args = parser.parse_args()
 
-        if args.save:
+        if args.index:
+            # 仅创建向量索引模式
+            logger.info("="*60)
+            logger.info("仅创建向量索引模式")
+            logger.info("="*60)
+            logger.info("跳过实体合并和数据存储，仅创建向量索引")
+
+            # 直接创建向量索引
+            try:
+                create_vector_indexes_success = create_neo4j_vector_indexes(
+                    embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
+                    create_pagerank=True
+                )
+
+                if create_vector_indexes_success:
+                    logger.info("✅ 向量索引创建成功")
+                else:
+                    logger.error("❌ 向量索引创建失败")
+            except Exception as e:
+                logger.error(f"❌ 创建向量索引时发生错误: {e}")
+                import traceback
+                traceback.print_exc()
+        elif args.save:
             # 独立保存模式：优先从环境变量读取配置
             clear_existing = os.getenv("CLEAR_NEO4J", args.clear.lower() == "true")
             if isinstance(clear_existing, str):

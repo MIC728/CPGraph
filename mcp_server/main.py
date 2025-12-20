@@ -950,12 +950,15 @@ if __name__ == "__main__":
 
     asyncio.run(init_service())
     import asyncio
-    # 从环境变量读取MCP端口配置
+    # 从环境变量读取MCP配置
+    mcp_host = os.getenv("MCP_HOST", "127.0.0.1")
     mcp_port = int(os.getenv("MCP_PORT", "8000"))
+    # 从环境变量读取日志等级（默认 INFO），并转换为小写
+    mcp_log_level = os.getenv("LOG_LEVEL", "INFO").lower()
     asyncio.run(mcp.run_async(
             transport="streamable-http",
-            host="127.0.0.1",
+            host=mcp_host,
             port=mcp_port,
-            log_level="debug",
+            log_level=mcp_log_level,
             stateless_http=True
         ))

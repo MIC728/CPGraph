@@ -27,7 +27,7 @@
 
 1. **克隆项目**
 ```bash
-git clone <repository-url>
+git clone https://github.com/MIC728/CPGraph.git
 cd CPGraph
 ```
 
@@ -70,18 +70,14 @@ python mcp_server/main.py
    题目格式示例：
    ```json
    {
+     "problem_id": "P1234",
      "title": "最大子段和",
-     "difficulty": "Medium",
-     "tags": ["动态规划", "数组"],
      "description": "给定一个整数数组，找到和最大的连续子数组...",
-     "input_format": "第一行包含一个整数 n...",
-     "output_format": "输出最大子段和",
-     "constraints": "1 ≤ n ≤ 10^5",
-     "sample_input": "5\n1 -2 3 4 -3",
-     "sample_output": "7",
-     "source": "洛谷 P1115"
+     "solution": "使用动态规划，维护以每个位置结尾的最大子段和..."
    }
    ```
+
+   > 提示：题目 JSON 格式无任何限制，所有字段都会被自动提取和处理。但是建议包含题目ID，题目名，题面和题解
 
 ### 第一步：文件提取和实体生成
 
@@ -96,9 +92,9 @@ python file_extract.py ./problems.jsonl --mode problem
 ```
 
 **输出文件：**
-- `kg_storage/entities.json` - 初始实体列表
-- `kg_storage/relations.json` - 初始关系列表
-- `kg_storage/chunks.json` - 文本块列表
+- `extracted_data/entities.json` - 初始实体列表
+- `extracted_data/relations.json` - 初始关系列表
+- `extracted_data/chunks.json` - 文本块列表
 
 ### 第二步：实体合并和优化
 
@@ -111,11 +107,12 @@ python entity_merge.py
 
 **参数说明：**
 - `--save`: 仅保存模式，从 merged_data 读取数据并存储到 Neo4j
+- `--index`: 仅创建向量索引模式，跳过保存到 Neo4j
 - `--data-dir`: 指定数据目录（默认：./merged_data）
 - `--clear`: 是否清空现有数据（默认：true）
 - `--no-index`: 不创建向量索引
 
-**注意：** 确保 `.env` 文件中的 `EXTRACTOR_OUTPUT_DIR` 与 `file_extract.py` 的输出目录一致（默认为 `./kg_storage`）。
+**注意：** 确保 `.env` 文件中的 `EXTRACTOR_OUTPUT_DIR` 与 `file_extract.py` 的输出目录一致（默认为 `./extracted_data`）。
 
 **主要功能：**
 - 🔄 **增量更新**：支持多次提取，自动合并新数据
@@ -135,7 +132,7 @@ python entity_merge.py
 可以通过 `.env` 文件配置处理参数，主要选项包括：
 
 **关键配置：**
-- `EXTRACTOR_OUTPUT_DIR`: file_extract.py 输出目录（默认：./kg_storage）
+- `EXTRACTOR_OUTPUT_DIR`: file_extract.py 输出目录（默认：./extracted_data）
 - `MERGED_DATA_DIR`: entity_merge.py 输出目录（默认：./merged_data）
 - `MCP_PORT`: MCP 服务器监听端口（默认：8000）
 - `CLEAR_NEO4J`: 是否清空 Neo4j 现有数据（默认：true）
