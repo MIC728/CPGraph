@@ -139,6 +139,9 @@ class KGQueryService:
         self.driver = None  # AsyncDriver 实例（内置连接池）
         self.kg_engine = None  # 单个引擎实例
         self.initialized = False
+        self.chunks_cache: Optional[Dict] = None  # 新增：chunks 缓存
+        self.chunks_cache_path: Optional[str] = None  # 新增：缓存文件路径
+        self.chunks_cache_loaded: bool = False  # 新增：缓存加载标志
         logger.info(f"[OK] KGQueryService initialized")
 
     async def initialize(
@@ -189,6 +192,29 @@ class KGQueryService:
                 embedding_func=embedding_func,
             )
             logger.info(f"[OK] KGQueryEngine initialized")
+
+            # 读取 chunks JSON 路径配置（使用 MERGED_DATA_DIR 环境变量）
+            merged_data_dir = os.getenv("MERGED_DATA_DIR", str(project_root / "merged_data"))
+            chunks_json_path = os.path.join(merged_data_dir, "chunks_backup.json")
+            logger.info(f"[CONFIG] Using MERGED_DATA_DIR from env: {merged_data_dir}")
+
+            self.chunks_cache_path = str(chunks_json_path)
+
+            # 预加载 chunks 到缓存
+            if os.path.exists(self.chunks_cache_path):
+                try:
+                    with open(self.chunks_cache_path, 'r', encoding='utf-8') as f:
+                        self.chunks_cache = json.load(f)
+                    self.chunks_cache_loaded = True
+                    logger.info(f"[OK] Pre-loaded {len(self.chunks_cache)} chunks into cache")
+                except Exception as e:
+                    logger.warning(f"[WARNING] Failed to preload chunks cache: {e}")
+                    self.chunks_cache = {}
+                    self.chunks_cache_loaded = False
+            else:
+                logger.info(f"[INFO] Chunks file not found: {self.chunks_cache_path}, will use dynamic loading")
+                self.chunks_cache = {}
+                self.chunks_cache_loaded = False
 
             self.initialized = True
             logger.info(f"[OK] KGQueryService initialized successfully (async driver with built-in connection pool)")
@@ -522,19 +548,25 @@ class KGQueryService:
                     for chunk_id in unique_chunk_ids
                 ]
 
-            # 如果需要完整内容，优先尝试从 chunks.json 文件读取
+            # 如果需要完整内容，优先从缓存获取
             chunk_details = []
             chunks_map = {}
 
-            # 尝试从 chunks.json 文件读取
-            chunks_json_path = os.path.join(project_root, "merged_data", "chunks_backup.json")
-            if os.path.exists(chunks_json_path):
-                try:
-                    with open(chunks_json_path, 'r', encoding='utf-8') as f:
-                        chunks_map = json.load(f)
-                    logger.info(f"Loaded {len(chunks_map)} chunks from {chunks_json_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to load chunks.json: {e}")
+            if self.chunks_cache_loaded and self.chunks_cache:
+                # 使用预加载的缓存
+                chunks_map = self.chunks_cache
+                logger.debug(f"Using pre-loaded chunks cache ({len(chunks_map)} items)")
+            else:
+                # 动态加载（fallback）
+                if os.path.exists(self.chunks_cache_path):
+                    try:
+                        with open(self.chunks_cache_path, 'r', encoding='utf-8') as f:
+                            chunks_map = json.load(f)
+                        logger.info(f"Dynamic loaded {len(chunks_map)} chunks from {self.chunks_cache_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load chunks.json: {e}")
+                else:
+                    logger.info(f"Chunks file not found: {self.chunks_cache_path}")
 
             for chunk_id in unique_chunk_ids:
                 chunk_detail = {
