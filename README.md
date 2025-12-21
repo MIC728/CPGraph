@@ -44,7 +44,7 @@ cp .env.example .env
 
 4. **启动服务**
 ```bash
-python mcp_server/mcp.py
+python mcp.py
 ```
 
 ## 📝 如何使用文本提取
