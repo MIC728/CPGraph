@@ -126,7 +126,7 @@ async def extract_and_extract(input_path: str, mode: str):
         config = ExtractionConfig(
             thread_count=int(os.getenv("THREAD_COUNT", "16")),
             max_concurrent_per_thread=int(os.getenv("MAX_CONCURRENT", "8")),
-            chunk_token_size=10000000000,
+            chunk_token_size=100000000,
             chunk_overlap_token_size=int(os.getenv("CHUNK_OVERLAP_SIZE", "100")),
             extraction_mode="problem",
             output_dir=os.getenv("EXTRACTOR_OUTPUT_DIR", "./kg_storage"),
@@ -145,7 +145,7 @@ async def extract_and_extract(input_path: str, mode: str):
         )
     else:
         entities, relations = await extract_problems_async(
-            documents=texts[:10],
+            documents=texts,
             llm_func=llm_func,
             config=config
         )
@@ -199,10 +199,12 @@ async def main():
         return 1
 
 if __name__ == "__main__":
-    from src.llm_tracker import cleanup
+    from src.llm_tracker import cleanup, print_report, init_tracker
 
+    init_tracker()
     try:
         exit_code = asyncio.run(main())
         exit(exit_code)
     finally:
+        print_report()
         cleanup()

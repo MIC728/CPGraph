@@ -62,8 +62,8 @@ PROMPTS["problem_entity_extraction_system_prompt"] = """
 
     *   **Entity Details:** For each identified entity, extract the following information:
         *   `entity_name`: 使用标准名称，保持一致性；保留原始专有名词
-        *   `entity_type_dim1`: 第一维度技术分类，优先使用竞赛相关类型：{entity_types_dim1}。若无适用类型，则使用“其他”
-        *   `entity_type_dim2`: 第二维度应用层次，优先使用竞赛相关类型：{entity_types_dim2}。若无适用类型，则使用“其他”
+        *   `entity_type_dim1`: 第一维度技术分类（只允许选择一个！），优先使用竞赛相关类型：{entity_types_dim1}。若无适用类型，则使用“其他”
+        *   `entity_type_dim2`: 第二维度应用层次（可多选），优先使用竞赛相关类型：{entity_types_dim2}。若无适用类型，则使用“其他”
         *   `entity_description`: 简洁描述，突出核心概念和竞赛应用场景，**避免具体实现细节和使用场景**。
             *   **特别地，对于`entity_type_dim2`为“题目”的实体**：其`entity_description`**必须**是一个专门生成的语义摘要（生成方法见第3部分）。
 
@@ -97,7 +97,7 @@ PROMPTS["problem_entity_extraction_system_prompt"] = """
     *   **最重要规则**：对于每个文本，只能提取一个题目类型实体，简述题意，技巧和知识点个数不限。题目与使用到的关键技巧（如果有）用关系连接，技巧和与技巧相关的核心知识点用关系连接。
           也就是：题目--[某种关系]--技巧（可能没有）--[某种关系]--核心知识点
     *   **题目实体提取**：
-        *   提取题目的核心描述和约束条件，使用`entity_type_dim2=“题目”`，entity_type_dim1根据题意从允许的第一维度类型（entity_type_dim1）标签中选择（如“动态规划”，“数据结构”，除非极特殊情况，不要使用“其他”类型！），`entity_name`必须使用题目ID开头，且题目ID末尾用空格分隔。
+        *   提取题目的核心描述和约束条件，使用`entity_type_dim2=“题目”`，entity_type_dim1根据题意从允许的第一维度类型（entity_type_dim1）标签中选择（只允许选择一个！），`entity_name`必须使用题目ID开头，且题目ID末尾用空格分隔。
         *   **题目实体的`entity_description`字段生成规则**：你**必须**为每个题目实体生成一个专门的语义摘要。请基于**题目描述**和**题解思路**，完成以下分析并整合成摘要：
             1.  **抽象题意**：抛开所有故事背景，题目可以抽象为什么纯粹的数学模型或数据结构？
             2.  **核心挑战**：本题最独特、最关键的难点或约束是什么？
@@ -196,7 +196,8 @@ PROMPTS["entity_extraction_system_prompt"] = """---Role---
             - 当无法确定时，选择"其他"而不是创造新类型
             - 同一实体的两个维度类型必须严格从对应列表中选择
             - 题目类型判断时，重点关注题目名称和描述中的关键词（如"平衡树"、"线段树"等直接对应数据结构类型）
-            - 支持多个类型（不推荐），用逗号分隔保持相对顺序（如：数据结构,算法思想）
+            - entity_type_dim1只允许选择一个类型！
+            - entity_type_dim2支持多个类型，用逗号分隔保持相对顺序（如：数据结构,算法思想）
 
     *   **识别范围：** 识别信息学竞赛中的核心概念、算法、数据结构和重要技巧。**严格限制提取范围，只提取以下类型的实体（此规则优先级高于一切）！**：
         - 经典算法和数据结构名称
@@ -211,7 +212,7 @@ PROMPTS["entity_extraction_system_prompt"] = """---Role---
         - 题目特定的技术参数和变量
     *   **Entity Details:** For each identified entity, extract the following information:
         *   `entity_name`: 使用标准名称，保持一致性；保留原始专有名词。
-        *   `entity_type_dim1`: 第一维度技术分类，优先使用竞赛相关类型：{entity_types_dim1}。若无适用类型，则使用"其他"。**支持多个类型（不推荐），用逗号分隔保持相对顺序（如：数据结构,算法思想）**。
+        *   `entity_type_dim1`: 第一维度技术分类，优先使用竞赛相关类型：{entity_types_dim1}。若无适用类型，则使用"其他"。
         *   `entity_type_dim2`: 第二维度应用层次，优先使用竞赛相关类型：{entity_types_dim2}。若无适用类型，则使用"其他"。**支持多个类型，用逗号分隔保持相对顺序（如：技巧,模型,算法）**。
         *   `entity_description`: 简洁描述，突出核心概念和竞赛应用场景，**避免具体实现细节和使用场景**。注意：实体描述只关注这个实体本身信息。
     *   **Output Format - Entities:** Output a total of 5 fields for each entity, delimited by `{tuple_delimiter}`, on a single line. The first field *must* be the literal string `entity`.
@@ -655,7 +656,7 @@ PROMPTS["entity_merge_evaluation"] = """---Role---
 {current_entity}
 ```
 
-相似实体：
+相似实体（已截断过长的描述）：
 ```json
 {similar_entities}
 ```

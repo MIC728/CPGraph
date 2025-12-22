@@ -482,6 +482,8 @@ class EntityDataLoader:
             """处理单个批次"""
             nonlocal successful_count, failed_count
 
+            logger.debug(f"开始处理批次 {batch_idx + 1}/{total_batches} ({len(batch_texts)} 个文本)")
+
             async with semaphore:
                 try:
                     # 调用嵌入函数
@@ -508,7 +510,7 @@ class EntityDataLoader:
                                 successful_count += 1
                             else:
                                 failed_count += 1
-                        logger.debug(f"批次 {batch_idx + 1}/{total_batches} 完成: {len(batch_texts)} 个")
+                        logger.info(f"批次 {batch_idx + 1}/{total_batches} 完成: {len(batch_texts)} 个实体")
                     else:
                         failed_count += len(batch_texts)
                         logger.warning(f"批次 {batch_idx + 1} 返回的嵌入数量不匹配")
@@ -528,12 +530,28 @@ class EntityDataLoader:
 
         # 并发执行所有批次
         start_time = time.time()
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.time() - start_time
 
-        logger.info(f"嵌入生成完成: 成功 {successful_count}, 失败 {failed_count}")
-        logger.info(f"耗时: {elapsed:.2f}秒, 速度: {successful_count / elapsed:.1f} 实体/秒")
+        # 处理异常结果
+        exception_count = 0
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                exception_count += 1
+                logger.error(f"批次 {i+1} 执行异常: {result}")
 
+        # 添加防护日志，避免除零错误
+        try:
+            logger.info(f"嵌入生成完成: 成功 {successful_count}, 失败 {failed_count}, 异常 {exception_count}")
+            if elapsed > 0:
+                speed = successful_count / elapsed
+                logger.info(f"耗时: {elapsed:.2f}秒, 速度: {speed:.1f} 实体/秒")
+            else:
+                logger.info(f"耗时: {elapsed:.2f}秒")
+        except Exception as e:
+            logger.error(f"打印统计信息失败: {e}")
+
+        logger.info("=== 嵌入生成流程即将返回 ===")
         return successful_count
 
     def _standardize_entities(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1406,23 +1424,34 @@ async def call_entity_evaluation_llm(
     entity_id = current_entity.get("entity_id", "")
 
     # 构建输入JSON - 使用完整ID（保留随机ID）
+    # 截断描述到前200字符以减少token开销
+    current_description = current_entity.get("description", "")
+    if len(current_description) > 200:
+        current_description = current_description[:200]
+        logger.debug(f"实体 {entity_id} 描述已截断到200字符")
+
     current_entity_json = json.dumps({
         "id": entity_id,
         "type_dim1": current_entity.get("entity_type_dim1", "UNKNOWN"),
         "type_dim2": current_entity.get("entity_type_dim2", "UNKNOWN"),
-        "description": current_entity.get("description", "")
+        "description": current_description
     }, ensure_ascii=False, indent=2)
 
-    # 相似实体保留完整ID
-    similar_entities_json = json.dumps([
-        {
+    # 相似实体保留完整ID，截断描述到前200字符
+    similar_entities_data = []
+    for e in similar_entities:
+        desc = e.get("description", "")
+        if len(desc) > 200:
+            desc = desc[:200]
+            logger.debug(f"相似实体 {e.get('entity_id', '')} 描述已截断到200字符")
+        similar_entities_data.append({
             "id": e.get("entity_id", ""),
             "type_dim1": e.get("entity_type_dim1", "UNKNOWN"),
             "type_dim2": e.get("entity_type_dim2", "UNKNOWN"),
-            "description": e.get("description", "")
-        }
-        for e in similar_entities
-    ], ensure_ascii=False, indent=2)
+            "description": desc
+        })
+
+    similar_entities_json = json.dumps(similar_entities_data, ensure_ascii=False, indent=2)
 
     # 构建prompt
     prompt = PROMPTS["entity_merge_evaluation"].format(
@@ -1755,6 +1784,7 @@ def merge_entity_group(group: List[str], entities_dict: Dict[str, Dict[str, Any]
     # 合并描述策略
     GRAPH_FIELD_SEP = "<SEP>"
     FORCE_LLM_THRESHOLD = 4  # 超过4个描述使用LLM
+    TRUNCATE_TO_LLM = 8  # 送给LLM的最大描述数量
 
     if len(descriptions) <= FORCE_LLM_THRESHOLD:
         # 少量描述直接拼接
@@ -1768,14 +1798,18 @@ def merge_entity_group(group: List[str], entities_dict: Dict[str, Dict[str, Any]
             llm_service = LLMSummaryService()
 
             entity_name = primary_entity_id or f"Entity_{chunk_name}"
-            logger.info(f"  → 使用LLM合并 {len(descriptions)} 个描述")
+            # 先按长度降序排序，取最长的8条
+            descriptions_sorted = sorted(descriptions, key=lambda x: -len(x))
+            descriptions_for_llm = descriptions_sorted[:TRUNCATE_TO_LLM]
+
+            logger.info(f"  → 使用LLM合并 {len(descriptions)} 个描述（截断为最长的{TRUNCATE_TO_LLM}条）")
 
             # 同步调用LLM摘要服务
             async def _summarize_descriptions():
                 return await llm_service.summarize_descriptions(
                     description_type="Entity",
                     description_name=entity_name,
-                    description_list=descriptions,
+                    description_list=descriptions_for_llm,
                     separator=GRAPH_FIELD_SEP,
                     summary_length="One Paragraphs",
                     language="zh-CN"
@@ -1904,7 +1938,7 @@ async def merge_entity_group_async(group: List[str], entities_dict: Dict[str, Di
     # 合并描述策略
     GRAPH_FIELD_SEP = "<SEP>"
     FORCE_LLM_THRESHOLD = 4  # 超过4个描述使用LLM
-    
+
     if len(descriptions) <= FORCE_LLM_THRESHOLD:
         # 少量描述直接拼接
         main_entity['description'] = GRAPH_FIELD_SEP.join(descriptions) if descriptions else ""
@@ -1915,10 +1949,9 @@ async def merge_entity_group_async(group: List[str], entities_dict: Dict[str, Di
             # 导入LLM摘要服务
             from src.llm_summary_service import LLMSummaryService
             llm_service = LLMSummaryService()
-            
+
             entity_name = primary_entity_id or f"Entity_{chunk_name}"
-            logger.info(f"  → 使用LLM合并 {len(descriptions)} 个描述")
-            
+
             # 异步调用LLM摘要服务
             final_description = await llm_service.summarize_descriptions(
                 description_type="Entity",
@@ -1930,7 +1963,7 @@ async def merge_entity_group_async(group: List[str], entities_dict: Dict[str, Di
             )
             main_entity['description'] = final_description
             logger.info(f"    LLM生成的描述: {final_description[:100]}...")
-            
+
         except Exception as e:
             logger.warning(f"LLM描述生成失败: {e}，使用原始描述拼接")
             main_entity['description'] = GRAPH_FIELD_SEP.join(descriptions)
@@ -2344,20 +2377,37 @@ async def process_entity_chunk_with_llm(
 
         # ==================== 根据实体类型分流处理 ====================
         is_problem_entity = entity.get("is_problem_extracted", False)
-
         if is_problem_entity:
-            # 题目实体：直接使用相似度阈值判断
-            if similar_entities and top1_similarity >= problem_similarity_threshold:
-                # 高相似度：直接合并
-                best_match_entity = similar_entities[0]
-                best_match_entity_id = best_match_entity.get("entity_id")
-                entities_map[entity_id] = best_match_entity_id
-                auto_merged_count += 1
-                logger.debug(f"  ✓ 题目实体自动合并: {entity_id} -> {best_match_entity_id} (相似度: {top1_similarity:.3f})")
-            else:
-                # 低相似度：直接跳过
-                auto_skipped_count += 1
-                logger.debug(f"  ○ 题目实体自动跳过: {entity_id} (相似度: {top1_similarity:.3f})")
+
+            current_clean_name = extract_entity_name(entity_id)
+            id_match_found = False
+
+            for similar_entity in similar_entities:
+                similar_clean_name = extract_entity_name(similar_entity.get("entity_id", ""))
+                if current_clean_name == similar_clean_name:
+                    # ID完全匹配，直接合并，跳过LLM调用
+                    best_match_entity_id = similar_entity.get("entity_id")
+                    entities_map[entity_id] = best_match_entity_id
+                    auto_merged_count += 1
+                    logger.debug(
+                        f"  ✓ ID匹配合并: {entity_id} -> {best_match_entity_id} (名称匹配: {current_clean_name})")
+                    id_match_found = True
+                    break
+
+            # 如果没有ID匹配，才调用LLM评估
+            if not id_match_found:
+                # 题目实体：直接使用相似度阈值判断
+                if similar_entities and top1_similarity >= problem_similarity_threshold:
+                    # 高相似度：直接合并
+                    best_match_entity = similar_entities[0]
+                    best_match_entity_id = best_match_entity.get("entity_id")
+                    entities_map[entity_id] = best_match_entity_id
+                    auto_merged_count += 1
+                    logger.debug(f"  ✓ 题目实体自动合并: {entity_id} -> {best_match_entity_id} (相似度: {top1_similarity:.3f})")
+                else:
+                    # 低相似度：直接跳过
+                    auto_skipped_count += 1
+                    logger.debug(f"  ○ 题目实体自动跳过: {entity_id} (相似度: {top1_similarity:.3f})")
         else:
             # 普通实体：三级分流处理
             if similar_entities and top1_similarity >= high_similarity_threshold:
@@ -2375,9 +2425,26 @@ async def process_entity_chunk_with_llm(
 
             else:
                 # 中等相似度：调用LLM评估
-                coroutine = process_entity_with_hnsw(idx, entity, similar_entities)
-                llm_coroutines.append(coroutine)
-                llm_evaluation_count += 1
+                # 但首先检查是否有完全匹配的实体ID（去除随机ID后）
+                current_clean_name = extract_entity_name(entity_id)
+                id_match_found = False
+
+                for similar_entity in similar_entities:
+                    similar_clean_name = extract_entity_name(similar_entity.get("entity_id", ""))
+                    if current_clean_name == similar_clean_name:
+                        # ID完全匹配，直接合并，跳过LLM调用
+                        best_match_entity_id = similar_entity.get("entity_id")
+                        entities_map[entity_id] = best_match_entity_id
+                        auto_merged_count += 1
+                        logger.debug(f"  ✓ ID匹配合并: {entity_id} -> {best_match_entity_id} (名称匹配: {current_clean_name})")
+                        id_match_found = True
+                        break
+
+                # 如果没有ID匹配，才调用LLM评估
+                if not id_match_found:
+                    coroutine = process_entity_with_hnsw(idx, entity, similar_entities)
+                    llm_coroutines.append(coroutine)
+                    llm_evaluation_count += 1
 
     # 等待所有LLM协程完成
     logger.info(f"  启动 {len(llm_coroutines)} 个并行LLM协程...")
@@ -4047,7 +4114,7 @@ async def save_to_neo4j_only(
 
 if __name__ == "__main__":
     # 导入LLM使用跟踪器
-    from src.llm_tracker import init_tracker, cleanup
+    from src.llm_tracker import init_tracker, cleanup, print_report
     import argparse
 
     # 初始化tracker（根据环境变量 ENABLE_LLM_TRACKING 控制）
@@ -4101,5 +4168,6 @@ if __name__ == "__main__":
             asyncio.run(main())
     finally:
         # 程序结束时自动打印报告并卸载tracker
+        print_report()
         cleanup()
 

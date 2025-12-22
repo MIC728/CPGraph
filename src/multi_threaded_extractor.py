@@ -788,32 +788,6 @@ class FileExtractionController:
             relations_file = os.path.join(self.config.output_dir, "relations.json")
             chunks_file = os.path.join(self.config.output_dir, "chunks.json")
 
-            # 如果是题目提取模式，尝试与现有文件合并
-            if self.config.extraction_mode == "problem":
-                # 读取现有文件
-                existing_entities = []
-                existing_relations = []
-                existing_chunks = {}
-
-                if os.path.exists(entities_file):
-                    with open(entities_file, 'r', encoding='utf-8') as f:
-                        existing_entities = json.load(f)
-
-                if os.path.exists(relations_file):
-                    with open(relations_file, 'r', encoding='utf-8') as f:
-                        existing_relations = json.load(f)
-
-                if os.path.exists(chunks_file):
-                    with open(chunks_file, 'r', encoding='utf-8') as f:
-                        existing_chunks = json.load(f)
-
-                # 合并数据（简单的列表扩展）
-                all_entities = existing_entities + entities
-                all_relations = existing_relations + relations
-                all_chunks = {**existing_chunks, **{chunk["chunk_id"]: chunk for chunk in chunks or []}}
-
-                entities, relations, chunks = all_entities, all_relations, list(all_chunks.values())
-
             # 保存实体
             with open(entities_file, 'w', encoding='utf-8') as f:
                 json.dump(entities, f, ensure_ascii=False, indent=2)

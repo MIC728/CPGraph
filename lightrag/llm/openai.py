@@ -20,6 +20,7 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
+    before_sleep,
 )
 from lightrag.utils import (
     wrap_embedding_func_with_attrs,
@@ -594,6 +595,11 @@ async def nvidia_openai_complete(
     return result
 
 
+def log_retry(retry_state):
+    """重试时打印日志"""
+    logger.warning(f"嵌入API调用失败，{retry_state.attempt_number}秒后进行第{retry_state.attempt_number}次重试...")
+
+
 @wrap_embedding_func_with_attrs(embedding_dim=1536)
 @retry(
     stop=stop_after_attempt(3),
@@ -603,6 +609,7 @@ async def nvidia_openai_complete(
         | retry_if_exception_type(APIConnectionError)
         | retry_if_exception_type(APITimeoutError)
     ),
+    before_sleep=log_retry,
 )
 async def openai_embed(
     texts: list[str],
