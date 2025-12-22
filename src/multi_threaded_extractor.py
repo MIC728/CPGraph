@@ -70,6 +70,7 @@ class ExtractionConfig:
 
     # 输出参数
     output_dir: str = "../extracted_data"
+    incremental_write: bool = False  # 是否增量写入（追加到现有文件），默认False（覆盖）
 
     # 性能调优
     enable_progress_logging: bool = True
@@ -788,25 +789,89 @@ class FileExtractionController:
             relations_file = os.path.join(self.config.output_dir, "relations.json")
             chunks_file = os.path.join(self.config.output_dir, "chunks.json")
 
-            # 保存实体
-            with open(entities_file, 'w', encoding='utf-8') as f:
-                json.dump(entities, f, ensure_ascii=False, indent=2)
+            # 根据配置决定写入模式
+            if self.config.incremental_write:
+                # 增量写入：读取现有文件，合并数据
+                existing_entities = []
+                existing_relations = []
+                existing_chunks = {}
 
-            # 保存关系
-            with open(relations_file, 'w', encoding='utf-8') as f:
-                json.dump(relations, f, ensure_ascii=False, indent=2)
+                # 读取现有实体
+                if os.path.exists(entities_file):
+                    with open(entities_file, 'r', encoding='utf-8') as f:
+                        existing_entities = json.load(f)
+                    logger.info(f"读取现有实体: {len(existing_entities)} 个")
 
-            # 保存分块（chunk_id -> chunk 映射）
-            if chunks:
-                chunks_map = {chunk["chunk_id"]: chunk for chunk in chunks}
-                with open(chunks_file, 'w', encoding='utf-8') as f:
-                    json.dump(chunks_map, f, ensure_ascii=False, indent=2)
+                # 读取现有关系
+                if os.path.exists(relations_file):
+                    with open(relations_file, 'r', encoding='utf-8') as f:
+                        existing_relations = json.load(f)
+                    logger.info(f"读取现有关系: {len(existing_relations)} 个")
 
-            logger.info(f"数据已保存到:")
-            logger.info(f"  实体: {entities_file}")
-            logger.info(f"  关系: {relations_file}")
-            if chunks:
-                logger.info(f"  分块: {chunks_file}")
+                # 读取现有分块
+                if chunks and os.path.exists(chunks_file):
+                    with open(chunks_file, 'r', encoding='utf-8') as f:
+                        existing_chunks = json.load(f)
+                    logger.info(f"读取现有分块: {len(existing_chunks)} 个")
+
+                # 合并数据
+                # 合并实体（基于entity_id去重）
+                existing_entity_ids = {e.get("entity_id") for e in existing_entities}
+                new_entities = [e for e in entities if e.get("entity_id") not in existing_entity_ids]
+                merged_entities = existing_entities + new_entities
+
+                # 合并关系（基于(src_id, tgt_id)去重）
+                existing_relation_keys = {(r.get("src_id"), r.get("tgt_id")) for r in existing_relations}
+                new_relations = [r for r in relations if (r.get("src_id"), r.get("tgt_id")) not in existing_relation_keys]
+                merged_relations = existing_relations + new_relations
+
+                # 合并分块
+                if chunks:
+                    new_chunks = {chunk["chunk_id"]: chunk for chunk in chunks}
+                    merged_chunks = {**existing_chunks, **new_chunks}
+                else:
+                    merged_chunks = existing_chunks
+
+                logger.info(f"增量写入统计:")
+                logger.info(f"  新增实体: {len(new_entities)}")
+                logger.info(f"  新增关系: {len(new_relations)}")
+                logger.info(f"  新增分块: {len(merged_chunks) - len(existing_chunks)}")
+
+                # 保存合并后的数据
+                with open(entities_file, 'w', encoding='utf-8') as f:
+                    json.dump(merged_entities, f, ensure_ascii=False, indent=2)
+
+                with open(relations_file, 'w', encoding='utf-8') as f:
+                    json.dump(merged_relations, f, ensure_ascii=False, indent=2)
+
+                if chunks:
+                    with open(chunks_file, 'w', encoding='utf-8') as f:
+                        json.dump(merged_chunks, f, ensure_ascii=False, indent=2)
+
+                logger.info(f"增量数据已保存到:")
+                logger.info(f"  实体: {entities_file} (总计: {len(merged_entities)})")
+                logger.info(f"  关系: {relations_file} (总计: {len(merged_relations)})")
+                if chunks:
+                    logger.info(f"  分块: {chunks_file} (总计: {len(merged_chunks)})")
+
+            else:
+                # 覆盖写入：直接保存新数据
+                with open(entities_file, 'w', encoding='utf-8') as f:
+                    json.dump(entities, f, ensure_ascii=False, indent=2)
+
+                with open(relations_file, 'w', encoding='utf-8') as f:
+                    json.dump(relations, f, ensure_ascii=False, indent=2)
+
+                if chunks:
+                    chunks_map = {chunk["chunk_id"]: chunk for chunk in chunks}
+                    with open(chunks_file, 'w', encoding='utf-8') as f:
+                        json.dump(chunks_map, f, ensure_ascii=False, indent=2)
+
+                logger.info(f"数据已保存到:")
+                logger.info(f"  实体: {entities_file}")
+                logger.info(f"  关系: {relations_file}")
+                if chunks:
+                    logger.info(f"  分块: {chunks_file}")
 
         except Exception as e:
             logger.error(f"保存JSON文件失败: {e}")

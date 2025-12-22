@@ -8,12 +8,14 @@ import os
 import asyncio
 import json
 import re
-from typing import List, Dict, Any, Optional, Tuple, Callable
+from typing import List, Dict, Any, Optional, Tuple, Callable, Coroutine
 import logging
 import time
 
 # 加载环境变量
 from dotenv import load_dotenv
+from numpy import ndarray, dtype
+
 load_dotenv(dotenv_path=".env", override=False)
 
 # LightRAG 常量和提示词（需要用于实体合并逻辑）
@@ -474,85 +476,125 @@ class EntityDataLoader:
         total_batches = (len(texts_to_embed) + batch_size - 1) // batch_size
         logger.info(f"总计 {len(texts_to_embed)} 个文本，分 {total_batches} 批处理")
 
+        # 真正的并发控制：使用队列和信号量
         semaphore = asyncio.Semaphore(max_concurrent)
-        successful_count = 0
-        failed_count = 0
+        task_queue = asyncio.Queue()
+        processed_batches = 0
+        failed_batches = 0
 
-        async def process_batch(batch_idx: int, batch_texts: List[str], batch_indices: List[int]):
-            """处理单个批次"""
-            nonlocal successful_count, failed_count
-
-            logger.debug(f"开始处理批次 {batch_idx + 1}/{total_batches} ({len(batch_texts)} 个文本)")
-
-            async with semaphore:
-                try:
-                    # 调用嵌入函数
-                    if asyncio.iscoroutinefunction(embedding_func):
-                        embeddings = await embedding_func(batch_texts)
-                    else:
-                        # 如果是同步函数，在线程池中执行
-                        loop = asyncio.get_event_loop()
-                        embeddings = await loop.run_in_executor(None, embedding_func, batch_texts)
-
-                    # 如果返回的是协程，await 它
-                    if asyncio.iscoroutine(embeddings):
-                        embeddings = await embeddings
-
-                    # 将嵌入向量写回实体
-                    if embeddings is not None and len(embeddings) == len(batch_texts):
-                        for i, idx in enumerate(batch_indices):
-                            if idx is not None:
-                                # 处理可能是 numpy array 或 list 的情况
-                                embedding = embeddings[i]
-                                if hasattr(embedding, 'tolist'):
-                                    embedding = embedding.tolist()
-                                self.entities[idx]["embedding"] = embedding
-                                successful_count += 1
-                            else:
-                                failed_count += 1
-                        logger.info(f"批次 {batch_idx + 1}/{total_batches} 完成: {len(batch_texts)} 个实体")
-                    else:
-                        failed_count += len(batch_texts)
-                        logger.warning(f"批次 {batch_idx + 1} 返回的嵌入数量不匹配")
-
-                except Exception as e:
-                    failed_count += len(batch_texts)
-                    logger.error(f"批次 {batch_idx + 1} 处理失败: {e}")
-
-        # 创建所有批次的任务
-        tasks = []
+        # 将所有批次放入队列
         for batch_idx in range(total_batches):
             start = batch_idx * batch_size
             end = min(start + batch_size, len(texts_to_embed))
             batch_texts = texts_to_embed[start:end]
             batch_indices = entity_indices[start:end]
-            tasks.append(process_batch(batch_idx, batch_texts, batch_indices))
+            await task_queue.put((batch_idx, batch_texts, batch_indices))
 
-        # 并发执行所有批次
+        async def process_with_semaphore(batch_idx, batch_texts, batch_indices):
+            """使用信号量限制并发"""
+            async with semaphore:
+                return await process_single_batch(batch_idx, batch_texts, batch_indices)
+
+        async def process_single_batch(batch_idx, batch_texts, batch_indices):
+            """处理单个批次，包含重试机制"""
+            max_retries = 3
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    logger.debug(f"开始处理批次 {batch_idx + 1}/{total_batches} ({len(batch_texts)} 个文本)")
+
+                    # 调用嵌入函数
+                    if asyncio.iscoroutinefunction(embedding_func):
+                        embeddings = await embedding_func(batch_texts)
+                    else:
+                        loop = asyncio.get_event_loop()
+                        embeddings = await loop.run_in_executor(None, embedding_func, batch_texts)
+
+                    if asyncio.iscoroutine(embeddings):
+                        embeddings = await embeddings
+
+                    # 验证返回结果
+                    if embeddings is None:
+                        raise ValueError("嵌入函数返回None")
+
+                    # 处理可能是numpy array或list的情况
+                    if hasattr(embeddings, '__len__') and len(embeddings) != len(batch_texts):
+                        raise ValueError(f"嵌入数量不匹配：期望 {len(batch_texts)}，实际 {len(embeddings)}")
+
+                    # 将嵌入向量写回实体
+                    success_count = 0
+                    for i, idx in enumerate(batch_indices):
+                        if idx is not None:
+                            embedding = embeddings[i] if hasattr(embeddings, '__getitem__') else embeddings
+                            if hasattr(embedding, 'tolist'):
+                                embedding = embedding.tolist()
+                            self.entities[idx]["embedding"] = embedding
+                            success_count += 1
+
+                    logger.info(f"批次 {batch_idx + 1}/{total_batches} 完成: {len(batch_texts)} 个实体")
+                    return True
+
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # 指数退避
+                        logger.warning(f"批次 {batch_idx + 1} 第 {attempt + 1} 次尝试失败: {e}，{wait_time}秒后重试...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.error(f"批次 {batch_idx + 1} 重试 {max_retries} 次后仍然失败: {e}")
+
+            # 所有重试都失败
+            nonlocal failed_batches
+            failed_batches += 1
+            return False
+
+        # 消费者：动态维持并发数
+        async def worker():
+            nonlocal processed_batches
+            while True:
+                try:
+                    # 等待获取批次任务，设置超时避免无限等待
+                    batch_data = await asyncio.wait_for(task_queue.get(), timeout=1.0)
+                    batch_idx, batch_texts, batch_indices = batch_data
+
+                    # 处理批次
+                    success = await process_with_semaphore(batch_idx, batch_texts, batch_indices)
+                    if success:
+                        processed_batches += 1
+
+                    # 标记任务完成
+                    task_queue.task_done()
+
+                except asyncio.TimeoutError:
+                    # 检查队列是否为空且没有运行中的任务
+                    if task_queue.empty():
+                        break
+                    continue
+                except Exception as e:
+                    logger.error(f"Worker异常: {e}")
+                    await asyncio.sleep(0.1)
+
+        # 启动worker池
         start_time = time.time()
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        workers = [asyncio.create_task(worker()) for _ in range(max_concurrent)]
+        await asyncio.gather(*workers)
         elapsed = time.time() - start_time
 
-        # 处理异常结果
-        exception_count = 0
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                exception_count += 1
-                logger.error(f"批次 {i+1} 执行异常: {result}")
-
-        # 添加防护日志，避免除零错误
-        try:
-            logger.info(f"嵌入生成完成: 成功 {successful_count}, 失败 {failed_count}, 异常 {exception_count}")
-            if elapsed > 0:
-                speed = successful_count / elapsed
-                logger.info(f"耗时: {elapsed:.2f}秒, 速度: {speed:.1f} 实体/秒")
-            else:
-                logger.info(f"耗时: {elapsed:.2f}秒")
-        except Exception as e:
-            logger.error(f"打印统计信息失败: {e}")
+        # 统计信息
+        total_processed = len(texts_to_embed)
+        logger.info(f"嵌入生成完成:")
+        logger.info(f"  - 总文本数: {total_processed}")
+        logger.info(f"  - 成功批次数: {processed_batches}")
+        logger.info(f"  - 失败批次数: {failed_batches}")
+        logger.info(f"  - 总批次数: {total_batches}")
+        logger.info(f"  - 耗时: {elapsed:.2f}秒")
+        if elapsed > 0:
+            speed = total_processed / elapsed
+            logger.info(f"  - 速度: {speed:.1f} 实体/秒")
 
         logger.info("=== 嵌入生成流程即将返回 ===")
-        return successful_count
+        return total_processed
 
     def _standardize_entities(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -1653,7 +1695,14 @@ async def reclassify_unknown_entities(
     for entity in entities:
         dim1 = entity.get("entity_type_dim1", "UNKNOWN")
         dim2 = entity.get("entity_type_dim2", "UNKNOWN")
-        if dim1 == "UNKNOWN" or dim2 == "UNKNOWN" or dim1 == "" or dim2 == "":
+
+        # 按逗号分隔dim2，检查每个类型是否在标准schema中
+        dim2_types = [t.strip() for t in dim2.split(',') if t.strip()]
+        is_dim1_valid = dim1 in entity_types_dim1
+        is_dim2_valid = all(t in entity_types_dim2 for t in dim2_types)
+
+        # 触发重分类的条件：UNKNOWN、空、或类型不在schema中
+        if dim1 == "UNKNOWN" or dim2 == "UNKNOWN" or dim1 == "" or dim2 == "" or not is_dim1_valid or not is_dim2_valid:
             unknown_entities.append(entity)
         else:
             normal_entities.append(entity)
@@ -1691,6 +1740,11 @@ async def reclassify_unknown_entities(
             updated_entity["entity_id"] = result.get("corrected_name", entity_id)
             updated_entity["entity_type_dim1"] = result.get("type_dim1", "其他")
             updated_entity["entity_type_dim2"] = result.get("type_dim2", "概念")
+
+            # 新增：更新描述（如果LLM提供了清洗后的描述）
+            cleaned_desc = result.get("cleaned_description")
+            if cleaned_desc:
+                updated_entity["description"] = cleaned_desc
 
             if updated_entity["entity_id"] != entity_id or updated_entity["entity_type_dim1"] != entity.get("entity_type_dim1"):
                 logger.info(f"  重分类: {entity_id} -> {updated_entity['entity_id']}, 类型: {updated_entity['entity_type_dim1']}/{updated_entity['entity_type_dim2']}")
@@ -2277,6 +2331,11 @@ async def process_entity_chunk_with_llm(
         entities_map[entity_id] = entity_id
         entities_dict[entity_id] = entity
 
+    # 全局同名合并映射：纯净名称 -> 实体ID
+    # 在第1步顺序处理中维护，实现全局同名检测
+    clean_name_to_entity_id = {}
+    clean_name_positions = {}  # 用于调试：纯净名称 -> 首次出现位置
+
     logger.info(f"分块 '{chunk_name}' 开始LLM增强处理，包含 {len(entities_with_embeddings)} 个实体")
 
     # ==================== 阶段1：HNSW顺序添加 + 智能分流处理 ====================
@@ -2331,6 +2390,22 @@ async def process_entity_chunk_with_llm(
 
     for idx, entity in enumerate(entities_with_embeddings):
         entity_id = entity.get("entity_id")
+        current_clean_name = extract_entity_name(entity_id)
+
+        # ==================== 步骤1：全局同名检查（新增） ====================
+        # 在HNSW查询之前先检查全局同名映射，实现真正的全局同名检测
+        if current_clean_name in clean_name_to_entity_id:
+            # 全局同名匹配，直接合并到已有实体（不插入HNSW）
+            best_match_entity_id = clean_name_to_entity_id[current_clean_name]
+            entities_map[entity_id] = best_match_entity_id
+            auto_merged_count += 1
+            logger.debug(f"  ✓ 全局同名合并: {entity_id} -> {best_match_entity_id} (名称: {current_clean_name})")
+            # 注意：不插入HNSW，因为已经被合并
+            continue
+
+        # ==================== 步骤2：记录新的纯净名称到全局映射 ====================
+        clean_name_to_entity_id[current_clean_name] = entity_id
+        clean_name_positions[current_clean_name] = idx
 
         # HNSW查询相似实体（只查询已插入的节点）
         similar_entities = []
@@ -2379,35 +2454,18 @@ async def process_entity_chunk_with_llm(
         is_problem_entity = entity.get("is_problem_extracted", False)
         if is_problem_entity:
 
-            current_clean_name = extract_entity_name(entity_id)
-            id_match_found = False
-
-            for similar_entity in similar_entities:
-                similar_clean_name = extract_entity_name(similar_entity.get("entity_id", ""))
-                if current_clean_name == similar_clean_name:
-                    # ID完全匹配，直接合并，跳过LLM调用
-                    best_match_entity_id = similar_entity.get("entity_id")
-                    entities_map[entity_id] = best_match_entity_id
-                    auto_merged_count += 1
-                    logger.debug(
-                        f"  ✓ ID匹配合并: {entity_id} -> {best_match_entity_id} (名称匹配: {current_clean_name})")
-                    id_match_found = True
-                    break
-
-            # 如果没有ID匹配，才调用LLM评估
-            if not id_match_found:
-                # 题目实体：直接使用相似度阈值判断
-                if similar_entities and top1_similarity >= problem_similarity_threshold:
-                    # 高相似度：直接合并
-                    best_match_entity = similar_entities[0]
-                    best_match_entity_id = best_match_entity.get("entity_id")
-                    entities_map[entity_id] = best_match_entity_id
-                    auto_merged_count += 1
-                    logger.debug(f"  ✓ 题目实体自动合并: {entity_id} -> {best_match_entity_id} (相似度: {top1_similarity:.3f})")
-                else:
-                    # 低相似度：直接跳过
-                    auto_skipped_count += 1
-                    logger.debug(f"  ○ 题目实体自动跳过: {entity_id} (相似度: {top1_similarity:.3f})")
+            # 题目实体：直接使用相似度阈值判断
+            if similar_entities and top1_similarity >= problem_similarity_threshold:
+                # 高相似度：直接合并
+                best_match_entity = similar_entities[0]
+                best_match_entity_id = best_match_entity.get("entity_id")
+                entities_map[entity_id] = best_match_entity_id
+                auto_merged_count += 1
+                logger.debug(f"  ✓ 题目实体自动合并: {entity_id} -> {best_match_entity_id} (相似度: {top1_similarity:.3f})")
+            else:
+                # 低相似度：直接跳过
+                auto_skipped_count += 1
+                logger.debug(f"  ○ 题目实体自动跳过: {entity_id} (相似度: {top1_similarity:.3f})")
         else:
             # 普通实体：三级分流处理
             if similar_entities and top1_similarity >= high_similarity_threshold:
@@ -2425,26 +2483,9 @@ async def process_entity_chunk_with_llm(
 
             else:
                 # 中等相似度：调用LLM评估
-                # 但首先检查是否有完全匹配的实体ID（去除随机ID后）
-                current_clean_name = extract_entity_name(entity_id)
-                id_match_found = False
-
-                for similar_entity in similar_entities:
-                    similar_clean_name = extract_entity_name(similar_entity.get("entity_id", ""))
-                    if current_clean_name == similar_clean_name:
-                        # ID完全匹配，直接合并，跳过LLM调用
-                        best_match_entity_id = similar_entity.get("entity_id")
-                        entities_map[entity_id] = best_match_entity_id
-                        auto_merged_count += 1
-                        logger.debug(f"  ✓ ID匹配合并: {entity_id} -> {best_match_entity_id} (名称匹配: {current_clean_name})")
-                        id_match_found = True
-                        break
-
-                # 如果没有ID匹配，才调用LLM评估
-                if not id_match_found:
-                    coroutine = process_entity_with_hnsw(idx, entity, similar_entities)
-                    llm_coroutines.append(coroutine)
-                    llm_evaluation_count += 1
+                coroutine = process_entity_with_hnsw(idx, entity, similar_entities)
+                llm_coroutines.append(coroutine)
+                llm_evaluation_count += 1
 
     # 等待所有LLM协程完成
     logger.info(f"  启动 {len(llm_coroutines)} 个并行LLM协程...")
@@ -3295,7 +3336,7 @@ async def main():
         logger.info("=" * 60)
 
         # 配置嵌入函数
-        async def embedding_func(texts: List[str]) -> List[List[float]]:
+        async def embedding_func(texts: List[str]) -> ndarray[tuple[Any, ...], dtype[Any]]:
             return await openai_embed(
                 texts,
                 model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),

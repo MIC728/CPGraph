@@ -84,12 +84,23 @@ python mcp_server.py
 使用 `file_extract.py` 进行文档解析和初始实体提取：
 
 ```bash
-# 提取普通文档
+# 覆盖写入模式（默认）
 python file_extract.py ./documents --mode normal
-
-# 提取竞赛题目
 python file_extract.py ./problems.jsonl --mode problem
+
+# 追加写入模式（追加到现有文件）
+python file_extract.py ./documents --mode normal --append
+python file_extract.py ./problems.jsonl --mode problem --append
 ```
+
+**参数说明：**
+- `--mode normal`: 提取普通文本实体
+- `--mode problem`: 提取题目专用实体（不分割题目和题解）
+- `--append`: 追加写入模式，追加到现有文件而不是覆盖（默认：False）
+
+**写入模式对比：**
+- **覆盖写入（默认）**：直接覆盖现有文件，适合初次提取
+- **追加写入**：智能合并现有数据，避免重复实体，适合多次提取
 
 **输出文件：**
 - `extracted_data/entities.json` - 初始实体列表

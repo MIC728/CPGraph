@@ -101,7 +101,7 @@ async def create_llm_func():
         )
     return llm_model_func
 
-async def extract_and_extract(input_path: str, mode: str):
+async def extract_and_extract(input_path: str, mode: str, append: bool = False):
     print(f"🔍 提取文件: {input_path}")
     extractor = FileExtractor()
     texts = extractor.extract(input_path)
@@ -116,11 +116,13 @@ async def extract_and_extract(input_path: str, mode: str):
             max_concurrent_per_thread=int(os.getenv("MAX_CONCURRENT", "8")),
             chunk_token_size=int(os.getenv("CHUNK_SIZE", "1200")),
             chunk_overlap_token_size=int(os.getenv("CHUNK_OVERLAP_SIZE", "100")),
-            output_dir=os.getenv("EXTRACTOR_OUTPUT_DIR", "./kg_storage"),
+            output_dir=os.getenv("EXTRACTOR_OUTPUT_DIR", "./extracted_data"),
+            incremental_write=append,
             enable_progress_logging=True,
             log_interval=5
         )
         print(f"📝 模式: 普通文本提取")
+        print(f"📝 写入模式: {'追加写入' if append else '覆盖写入'}")
 
     elif mode == "problem":
         config = ExtractionConfig(
@@ -129,11 +131,13 @@ async def extract_and_extract(input_path: str, mode: str):
             chunk_token_size=100000000,
             chunk_overlap_token_size=int(os.getenv("CHUNK_OVERLAP_SIZE", "100")),
             extraction_mode="problem",
-            output_dir=os.getenv("EXTRACTOR_OUTPUT_DIR", "./kg_storage"),
+            output_dir=os.getenv("EXTRACTOR_OUTPUT_DIR", "./extracted_data"),
+            incremental_write=append,
             enable_progress_logging=True,
             log_interval=5
         )
         print(f"📝 模式: 题目文本提取")
+        print(f"📝 写入模式: {'追加写入' if append else '覆盖写入'}")
 
     print("🚀 开始实体提取...")
 
@@ -175,22 +179,30 @@ async def main():
         epilog="""
 使用示例:
   python file_extract.py ./documents --mode normal
+  python file_extract.py ./documents --mode normal --append
   python file_extract.py ./problems.jsonl --mode problem
+  python file_extract.py ./problems.jsonl --mode problem --append
 
 提取模式:
   normal   - 普通文本实体提取
   problem  - 题目专用实体提取（不分割题目和题解）
+
+写入模式:
+  --append    - 追加写入（追加到现有文件）
+  (默认)      - 覆盖写入（覆盖现有文件）
         """
     )
 
     parser.add_argument('input_path', help='输入路径（文件夹或文件）')
     parser.add_argument('--mode', choices=['normal', 'problem'], default='normal',
                        help='提取模式: normal(普通文本) 或 problem(题目文本)，默认 normal')
+    parser.add_argument('--append', action='store_true',
+                       help='追加写入模式：追加到现有文件而不是覆盖（默认: False）')
 
     args = parser.parse_args()
 
     try:
-        await extract_and_extract(args.input_path, args.mode)
+        await extract_and_extract(args.input_path, args.mode, args.append)
         return 0
     except Exception as e:
         print(f"\n❌ 错误: {e}")
