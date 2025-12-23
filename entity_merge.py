@@ -481,6 +481,7 @@ class EntityDataLoader:
         task_queue = asyncio.Queue()
         processed_batches = 0
         failed_batches = 0
+        remaining_tasks = total_batches  # 跟踪剩余任务数
 
         # 将所有批次放入队列
         for batch_idx in range(total_batches):
@@ -551,7 +552,7 @@ class EntityDataLoader:
 
         # 消费者：动态维持并发数
         async def worker():
-            nonlocal processed_batches
+            nonlocal processed_batches, remaining_tasks
             while True:
                 try:
                     # 等待获取批次任务，设置超时避免无限等待
@@ -566,13 +567,20 @@ class EntityDataLoader:
                     # 标记任务完成
                     task_queue.task_done()
 
+                    # 减少剩余任务计数
+                    remaining_tasks -= 1
+                    logger.debug(f"Worker完成任务，剩余任务: {remaining_tasks}")
+
                 except asyncio.TimeoutError:
-                    # 检查队列是否为空且没有运行中的任务
-                    if task_queue.empty():
+                    # 检查是否还有剩余任务
+                    if remaining_tasks <= 0:
+                        logger.debug(f"所有任务完成，Worker退出")
                         break
                     continue
                 except Exception as e:
                     logger.error(f"Worker异常: {e}")
+                    # 即使异常也要减少剩余任务
+                    remaining_tasks -= 1
                     await asyncio.sleep(0.1)
 
         # 启动worker池
@@ -588,6 +596,7 @@ class EntityDataLoader:
         logger.info(f"  - 成功批次数: {processed_batches}")
         logger.info(f"  - 失败批次数: {failed_batches}")
         logger.info(f"  - 总批次数: {total_batches}")
+        logger.info(f"  - 剩余任务: {remaining_tasks}")
         logger.info(f"  - 耗时: {elapsed:.2f}秒")
         if elapsed > 0:
             speed = total_processed / elapsed
@@ -1671,22 +1680,25 @@ async def reclassify_unknown_entities(
     llm_func: Callable,
     entity_types_dim1: List[str] = None,
     entity_types_dim2: List[str] = None,
-    max_concurrent: int = None
+    max_concurrent: int = None,
+    max_threads: int = None
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
-    预处理UNKNOWN类型的实体，使用LLM进行重分类
+    预处理UNKNOWN类型的实体，使用多线程+异步进行重分类
 
     Args:
         entities: 实体列表
         llm_func: LLM调用函数
         entity_types_dim1: 第一维度类型列表
         entity_types_dim2: 第二维度类型列表
-        max_concurrent: 最大并发数
+        max_concurrent: 每个线程内的最大并发数
+        max_threads: 最大线程数
 
     Returns:
         Tuple[List[Dict[str, Any]], int]: (处理后的实体列表, 删除的实体数)
     """
-    max_concurrent = max_concurrent or DEFAULT_ENTITY_MERGE_MAX_ASYNC
+    max_concurrent = max_concurrent or 20  # 每个线程内并发数
+    max_threads = max_threads or (os.cpu_count() or 8)  # 线程数
 
     # 分离UNKNOWN实体和正常实体
     unknown_entities = []
@@ -1712,64 +1724,112 @@ async def reclassify_unknown_entities(
         return entities, 0
 
     logger.info(f"开始重分类 {len(unknown_entities)} 个UNKNOWN类型实体")
+    logger.info(f"多线程+异步配置: {max_threads} 线程, 每线程{max_concurrent}并发")
 
-    # 并发处理UNKNOWN实体
-    semaphore = asyncio.Semaphore(max_concurrent)
-    deleted_count = 0
-    reclassified_entities = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    async def process_single(entity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        nonlocal deleted_count
-        async with semaphore:
-            entity_id = entity.get("entity_id", "")
+    # 将实体分块到线程池
+    chunk_size = max(1, len(unknown_entities) // max_threads)
+    entity_chunks = [unknown_entities[i:i + chunk_size] for i in range(0, len(unknown_entities), chunk_size)]
 
-            result = await call_entity_reclassify_llm(
-                entity=entity,
-                llm_func=llm_func,
-                entity_types_dim1=entity_types_dim1,
-                entity_types_dim2=entity_types_dim2
-            )
+    logger.info(f"分块策略: {len(entity_chunks)} 个线程块, 每块 {chunk_size} 个实体")
 
-            if result.get("should_delete"):
-                logger.info(f"  删除实体: {entity_id}")
-                deleted_count += 1
-                return None
+    total_deleted = 0
+    all_reclassified = []
 
-            # 更新实体信息
-            updated_entity = entity.copy()
-            updated_entity["entity_id"] = result.get("corrected_name", entity_id)
-            updated_entity["entity_type_dim1"] = result.get("type_dim1", "其他")
-            updated_entity["entity_type_dim2"] = result.get("type_dim2", "概念")
+    def process_chunk_in_thread(chunk_entities: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+        """在线程中处理实体块（使用独立事件循环）"""
+        deleted_count = 0
+        reclassified_entities = []
 
-            # 新增：更新描述（如果LLM提供了清洗后的描述）
-            cleaned_desc = result.get("cleaned_description")
-            if cleaned_desc:
-                updated_entity["description"] = cleaned_desc
+        async def thread_async_worker():
+            """在线程内运行的异步工作函数"""
+            async def process_single_async(entity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                nonlocal deleted_count
+                entity_id = entity.get("entity_id", "")
 
-            if updated_entity["entity_id"] != entity_id or updated_entity["entity_type_dim1"] != entity.get("entity_type_dim1"):
-                logger.info(f"  重分类: {entity_id} -> {updated_entity['entity_id']}, 类型: {updated_entity['entity_type_dim1']}/{updated_entity['entity_type_dim2']}")
+                result = await call_entity_reclassify_llm(
+                    entity=entity,
+                    llm_func=llm_func,
+                    entity_types_dim1=entity_types_dim1,
+                    entity_types_dim2=entity_types_dim2
+                )
 
-            return updated_entity
+                if result.get("should_delete"):
+                    logger.info(f"  删除实体: {entity_id}")
+                    deleted_count += 1
+                    return None
 
-    # 并发执行
-    tasks = [process_single(entity) for entity in unknown_entities]
-    results = await asyncio.gather(*tasks)
+                # 更新实体信息
+                updated_entity = entity.copy()
+                updated_entity["entity_id"] = result.get("corrected_name", entity_id)
+                updated_entity["entity_type_dim1"] = result.get("type_dim1", "其他")
+                updated_entity["entity_type_dim2"] = result.get("type_dim2", "概念")
 
-    # 收集非None结果
-    for result in results:
-        if result is not None:
-            reclassified_entities.append(result)
+                # 新增：更新描述（如果LLM提供了清洗后的描述）
+                cleaned_desc = result.get("cleaned_description")
+                if cleaned_desc:
+                    updated_entity["description"] = cleaned_desc
+
+                if updated_entity["entity_id"] != entity_id or updated_entity["entity_type_dim1"] != entity.get("entity_type_dim1"):
+                    logger.info(f"  重分类: {entity_id} -> {updated_entity['entity_id']}, 类型: {updated_entity['entity_type_dim1']}/{updated_entity['entity_type_dim2']}")
+
+                return updated_entity
+
+            # 线程内信号量控制并发
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def process_with_semaphore(entity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                async with semaphore:
+                    return await process_single_async(entity)
+
+            # 并发执行所有实体处理任务
+            tasks = [process_with_semaphore(entity) for entity in chunk_entities]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 收集结果
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"线程内处理异常: {result}")
+                    continue
+                if result is not None:
+                    reclassified_entities.append(result)
+
+        # 在线程中创建独立的事件循环并执行异步任务
+        asyncio.run(thread_async_worker())
+
+        return reclassified_entities, deleted_count
+
+    # 使用线程池并发处理
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        future_to_chunk = {}
+        for i, chunk in enumerate(entity_chunks):
+            future = executor.submit(process_chunk_in_thread, chunk)
+            future_to_chunk[future] = i
+            logger.info(f"提交线程块 {i+1}/{len(entity_chunks)} 到线程池 ({len(chunk)} 个实体)")
+
+        # 收集结果
+        for future in as_completed(future_to_chunk):
+            chunk_idx = future_to_chunk[future]
+            try:
+                reclassified, deleted = future.result()
+                all_reclassified.extend(reclassified)
+                total_deleted += deleted
+                logger.info(f"线程块 {chunk_idx + 1} 完成: 重分类 {len(reclassified)}, 删除 {deleted}")
+            except Exception as exc:
+                logger.error(f"线程块 {chunk_idx + 1} 失败: {exc}")
 
     # 合并结果
-    final_entities = normal_entities + reclassified_entities
+    final_entities = normal_entities + all_reclassified
 
     logger.info(f"UNKNOWN实体重分类完成:")
     logger.info(f"  - 原UNKNOWN实体数: {len(unknown_entities)}")
-    logger.info(f"  - 删除实体数: {deleted_count}")
-    logger.info(f"  - 重分类实体数: {len(reclassified_entities)}")
+    logger.info(f"  - 线程数: {max_threads}")
+    logger.info(f"  - 删除实体数: {total_deleted}")
+    logger.info(f"  - 重分类实体数: {len(all_reclassified)}")
     logger.info(f"  - 最终实体数: {len(final_entities)}")
 
-    return final_entities, deleted_count
+    return final_entities, total_deleted
 
 
 def merge_entity_group(group: List[str], entities_dict: Dict[str, Dict[str, Any]], chunk_name: str) -> Dict[str, Any]:
@@ -1838,7 +1898,7 @@ def merge_entity_group(group: List[str], entities_dict: Dict[str, Dict[str, Any]
     # 合并描述策略
     GRAPH_FIELD_SEP = "<SEP>"
     FORCE_LLM_THRESHOLD = 4  # 超过4个描述使用LLM
-    TRUNCATE_TO_LLM = 8  # 送给LLM的最大描述数量
+    MAX_DESCRIPTIONS_FOR_LLM = 1000  # 软截断：送给LLM的最大描述数量
 
     if len(descriptions) <= FORCE_LLM_THRESHOLD:
         # 少量描述直接拼接
@@ -1852,11 +1912,14 @@ def merge_entity_group(group: List[str], entities_dict: Dict[str, Dict[str, Any]
             llm_service = LLMSummaryService()
 
             entity_name = primary_entity_id or f"Entity_{chunk_name}"
-            # 先按长度降序排序，取最长的8条
+            # 先按长度降序排序，最多取前1000条
             descriptions_sorted = sorted(descriptions, key=lambda x: -len(x))
-            descriptions_for_llm = descriptions_sorted[:TRUNCATE_TO_LLM]
+            descriptions_for_llm = descriptions_sorted[:MAX_DESCRIPTIONS_FOR_LLM]
 
-            logger.info(f"  → 使用LLM合并 {len(descriptions)} 个描述（截断为最长的{TRUNCATE_TO_LLM}条）")
+            if len(descriptions) > MAX_DESCRIPTIONS_FOR_LLM:
+                logger.info(f"  → 使用LLM合并 {len(descriptions)} 个描述（软截断为前{MAX_DESCRIPTIONS_FOR_LLM}条最长描述）")
+            else:
+                logger.info(f"  → 使用LLM合并 {len(descriptions)} 个描述（全部描述，不截断）")
 
             # 同步调用LLM摘要服务
             async def _summarize_descriptions():
@@ -3375,7 +3438,8 @@ async def main():
             llm_func=llm_func,
             entity_types_dim1=DEFAULT_ENTITY_TYPES_DIM1,
             entity_types_dim2=DEFAULT_ENTITY_TYPES_DIM2,
-            max_concurrent=DEFAULT_ENTITY_MERGE_MAX_ASYNC
+            max_concurrent=DEFAULT_ENTITY_MERGE_MAX_ASYNC,
+            max_threads=16,
         )
 
         logger.info(f"预处理完成，剩余 {len(entities)} 个实体")
@@ -3616,18 +3680,51 @@ async def save_to_neo4j(
     driver = AsyncGraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
     try:
-        # ==================== 清空Neo4j数据（如果需要） ====================
+        # ==================== 清空Neo4j数据（如果需要，分批删除避免内存溢出） ====================
         if clear_existing:
             logger.warning("清空模式：将先删除所有Neo4j数据，再重新存入合并数据")
             try:
                 async with driver.session() as session:
-                    result = await session.run("MATCH (n) DETACH DELETE n")
-                    await result.consume()
+                    # 分批删除策略：避免一次性删除大量数据导致内存溢出
+                    batch_size = 1000  # 每批删除1000个节点
+                    total_deleted = 0
+
+                    # 分批删除关系
+                    logger.info("分批删除关系...")
+                    while True:
+                        result = await session.run(
+                            "MATCH ()-[r]-() WITH r LIMIT $batch_size DELETE r",
+                            batch_size=batch_size
+                        )
+                        consumed = await result.consume()
+                        if consumed.counters.relationships_deleted == 0:
+                            break
+                        logger.info(f"已删除 {consumed.counters.relationships_deleted} 个关系...")
+
+                    # 分批删除节点
+                    logger.info("分批删除节点...")
+                    while True:
+                        result = await session.run(
+                            "MATCH (n) WITH n LIMIT $batch_size DELETE n",
+                            batch_size=batch_size
+                        )
+                        consumed = await result.consume()
+                        deleted_in_this_batch = consumed.counters.nodes_deleted
+                        total_deleted += deleted_in_this_batch
+
+                        if deleted_in_this_batch == 0:
+                            break
+
+                        # 记录进度
+                        logger.info(f"本批删除 {deleted_in_this_batch} 个节点，累计 {total_deleted} 个...")
+
+                        # 短暂暂停避免过度占用资源
+                        await asyncio.sleep(0.1)
 
                     # 验证清空操作结果
                     stats["entities_cleared"] = len(merged_entities)
                     stats["relations_cleared"] = len(merged_relations)
-                    logger.info("已清空所有Neo4j数据")
+                    logger.info(f"已清空所有Neo4j数据，总计删除 {total_deleted} 个节点")
 
                     # 再次验证：检查是否还有剩余节点
                     result = await session.run("MATCH (n) RETURN count(n) as count")
@@ -3685,16 +3782,22 @@ async def save_to_neo4j(
                             if not dim2_labels:
                                 dim2_labels = ["UNKNOWN"]
 
-                            # 合并所有标签
-                            type_labels = dim1_labels + dim2_labels
+                            # 合并所有标签，始终包含Entity基础标签
+                            type_labels = ["Entity"] + dim1_labels + dim2_labels
                             labels_str = ":" + ":".join(type_labels)
 
                             # 构建Cypher查询
                             query = f"""
                             CREATE (n{labels_str} $props)
                             """
-                            await session.run(query, props=node_props)
-                            stats["entities_upserted"] += 1
+                            result = await session.run(query, props=node_props)
+                            consumed = await result.consume()
+                            if consumed.counters.nodes_created > 0:
+                                stats["entities_upserted"] += 1
+                            else:
+                                stats["entities_failed"] += 1
+                                stats["errors"].append(f"实体 {entity_id} 插入失败：未创建节点")
+                                logger.error(f"实体 {entity_id} 插入失败：未创建节点")
 
                         except Exception as e:
                             stats["entities_failed"] += 1
@@ -3720,8 +3823,8 @@ async def save_to_neo4j(
         logger.info("预构建节点映射...")
         entity_id_to_node = {}
         async with driver.session() as session:
-            # 查询所有实体节点
-            result = await session.run("MATCH (n:Entity) RETURN n.entity_id as entity_id, id(n) as node_id")
+            # 查询所有具有entity_id属性的节点（不管标签是什么）
+            result = await session.run("MATCH (n) WHERE n.entity_id IS NOT NULL RETURN n.entity_id as entity_id, elementId(n) as node_id")
             async for record in result:
                 entity_id_to_node[record["entity_id"]] = record["node_id"]
 
@@ -3771,9 +3874,9 @@ async def save_to_neo4j(
                     "created_at": relation.get("created_at", int(time.time()))
                 }
 
-                # 构建Cypher查询
+                # 构建Cypher查询 - 不依赖Entity标签，用entity_id属性匹配任意节点
                 query = f"""
-                MATCH (a:Entity), (b:Entity)
+                MATCH (a), (b)
                 WHERE a.entity_id = $src_id AND b.entity_id = $tgt_id
                 CREATE (a)-[r:{rel_type} $props]->(b)
                 """
@@ -3789,8 +3892,13 @@ async def save_to_neo4j(
             async with driver.session() as session:
                 try:
                     for query, params in batch:
-                        await session.run(query, params)
-                        stats["relations_upserted"] += 1
+                        result = await session.run(query, params)
+                        consumed = await result.consume()
+                        if consumed.counters.relationships_created > 0:
+                            stats["relations_upserted"] += 1
+                        else:
+                            stats["relations_failed"] += 1
+                            logger.error(f"关系插入失败: {params.get('src_id')} -> {params.get('tgt_id')}")
                     logger.info(f"关系批次 {i//BATCH_SIZE + 1} 完成: {len(batch)} 个关系")
                 except Exception as e:
                     stats["relations_failed"] += len(batch)
