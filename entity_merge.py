@@ -3552,7 +3552,7 @@ async def main():
         # 是否清空现有数据（可通过环境变量配置）
         clear_neo4j = os.getenv("CLEAR_NEO4J", "true").lower() == "true"
 
-        neo4j_stats = await save_to_neo4j(
+        neo4j_stats = save_to_neo4j(
             merged_entities=merged_entities,
             merged_relations=merged_relations,
             entity_mapping=entity_mapping,
@@ -3629,47 +3629,59 @@ def clean_relation_keywords(keywords_str: str, description: str) -> tuple[list[s
     return cleaned_keywords, description
 
 
-async def save_to_neo4j(
+def save_to_neo4j(
     merged_entities: List[Dict[str, Any]],
     merged_relations: List[Dict[str, Any]],
     entity_mapping: Dict[str, Optional[str]] = None,
-    clear_existing: bool = True
+    clear_existing: bool = True,
+    thread_count: int = 12,
+    entity_batch_size: int = 500,
+    relation_batch_size: int = 500
 ) -> Dict[str, Any]:
     """
-    将合并后的实体和关系数据存入Neo4j（使用官方neo4j异步驱动）
+    将合并后的实体和关系数据存入Neo4j
+
+    插入策略：
+    - 实体：多线程 + APOC apoc.periodic.iterate UNWIND 批量插入
+    - 关系：单线程 + UNWIND + apoc.create.relationship 批量插入
+    - 关系插入时使用 entity_mapping 进行 ID 映射
 
     Args:
         merged_entities: 合并后的实体列表
         merged_relations: 合并后的关系列表
         entity_mapping: 实体ID映射表（原始ID -> 最终ID，None表示删除）
-        clear_existing: 是否在写入前清空现有数据（谨慎使用）
+        clear_existing: 是否在写入前清空现有数据
+        thread_count: 实体插入的并行线程数
+        entity_batch_size: 实体插入的批次大小
+        relation_batch_size: 关系插入的批次大小
 
     Returns:
         Dict[str, Any]: 操作结果统计
     """
-    from neo4j import AsyncGraphDatabase
+    from neo4j import GraphDatabase
     from dotenv import load_dotenv
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
 
-    logger.info("=== 开始执行 save_to_neo4j (使用官方驱动) ===")
+    logger.info("=== 开始执行 save_to_neo4j ===")
+    logger.info(f"实体: {len(merged_entities)}, 关系: {len(merged_relations)}")
+    logger.info(f"实体插入线程数: {thread_count}, 实体批次大小: {entity_batch_size}")
+    logger.info(f"关系批次大小: {relation_batch_size}")
+    logger.info(f"entity_mapping: {'有' if entity_mapping else '无'}")
 
+    # 线程安全的统计计数器
+    stats_lock = threading.Lock()
     stats = {
         "entities_upserted": 0,
         "entities_failed": 0,
         "relations_upserted": 0,
         "relations_failed": 0,
         "relations_self_loops_removed": 0,
+        "relations_mapping_skipped": 0,
         "entities_cleared": 0,
         "relations_cleared": 0,
         "errors": []
     }
-
-    logger.info(f"开始将合并数据存入Neo4j: {len(merged_entities)} 个实体, {len(merged_relations)} 个关系")
-
-    # 调试：检查前几个关系的ID格式
-    if merged_relations:
-        logger.info("前5个关系的ID示例:")
-        for i, rel in enumerate(merged_relations[:5]):
-            logger.info(f"  {i+1}. {rel.get('src_id')} -> {rel.get('tgt_id')}")
 
     # ==================== 连接Neo4j ====================
     load_dotenv(dotenv_path=".env", override=False)
@@ -3677,195 +3689,231 @@ async def save_to_neo4j(
     neo4j_user = os.getenv("NEO4J_USERNAME", "neo4j")
     neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
 
-    driver = AsyncGraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+    driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
     try:
-        # ==================== 清空Neo4j数据（如果需要，分批删除避免内存溢出） ====================
+        # ==================== 清空Neo4j数据（分批删除避免内存溢出） ====================
         if clear_existing:
-            logger.warning("清空模式：将先删除所有Neo4j数据，再重新存入合并数据")
+            logger.warning("清空模式：删除所有现有数据后重新插入")
             try:
-                async with driver.session() as session:
-                    # 分批删除策略：避免一次性删除大量数据导致内存溢出
-                    batch_size = 1000  # 每批删除1000个节点
+                with driver.session() as session:
+                    batch_size = 1000
                     total_deleted = 0
 
                     # 分批删除关系
                     logger.info("分批删除关系...")
                     while True:
-                        result = await session.run(
+                        result = session.run(
                             "MATCH ()-[r]-() WITH r LIMIT $batch_size DELETE r",
                             batch_size=batch_size
                         )
-                        consumed = await result.consume()
+                        consumed = result.consume()
                         if consumed.counters.relationships_deleted == 0:
                             break
-                        logger.info(f"已删除 {consumed.counters.relationships_deleted} 个关系...")
 
                     # 分批删除节点
                     logger.info("分批删除节点...")
                     while True:
-                        result = await session.run(
+                        result = session.run(
                             "MATCH (n) WITH n LIMIT $batch_size DELETE n",
                             batch_size=batch_size
                         )
-                        consumed = await result.consume()
-                        deleted_in_this_batch = consumed.counters.nodes_deleted
-                        total_deleted += deleted_in_this_batch
-
-                        if deleted_in_this_batch == 0:
+                        consumed = result.consume()
+                        deleted = consumed.counters.nodes_deleted
+                        if deleted == 0:
                             break
+                        total_deleted += deleted
 
-                        # 记录进度
-                        logger.info(f"本批删除 {deleted_in_this_batch} 个节点，累计 {total_deleted} 个...")
-
-                        # 短暂暂停避免过度占用资源
-                        await asyncio.sleep(0.1)
-
-                    # 验证清空操作结果
                     stats["entities_cleared"] = len(merged_entities)
                     stats["relations_cleared"] = len(merged_relations)
-                    logger.info(f"已清空所有Neo4j数据，总计删除 {total_deleted} 个节点")
-
-                    # 再次验证：检查是否还有剩余节点
-                    result = await session.run("MATCH (n) RETURN count(n) as count")
-                    record = await result.single()
-                    remaining_count = record["count"]
-                    logger.info(f"清空后剩余节点数: {remaining_count}")
+                    logger.info(f"已清空Neo4j，删除 {total_deleted} 个节点")
 
             except Exception as e:
                 logger.error(f"清空Neo4j数据失败: {e}")
                 stats["errors"].append(f"清空Neo4j数据失败: {str(e)}")
 
-        # ==================== 插入实体数据 ====================
-        logger.info("开始插入实体数据...")
+        # ==================== 预处理实体数据 ====================
+        logger.info("预处理实体数据...")
+        all_entity_props = []
 
-        # 设置实体批处理大小（减小批次避免超时）
-        ENTITY_BATCH_SIZE = 500
-        entity_batches = [merged_entities[i:i + ENTITY_BATCH_SIZE]
-                          for i in range(0, len(merged_entities), ENTITY_BATCH_SIZE)]
+        for entity in merged_entities:
+            try:
+                entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
+                if not entity_id:
+                    continue
 
-        logger.info(f"实体总数: {len(merged_entities)}, 批次数: {len(entity_batches)}, 每批大小: {ENTITY_BATCH_SIZE}")
+                # 解析标签
+                dim1_str = entity.get("entity_type_dim1", "")
+                dim1_labels = [k.strip() for k in dim1_str.replace('，', ',').split(',') if k.strip()]
+                if not dim1_labels:
+                    dim1_labels = ["UNKNOWN"]
 
-        # 分批插入实体
-        for batch_idx, entity_batch in enumerate(entity_batches):
-            async with driver.session() as session:
+                dim2_str = entity.get("entity_type_dim2", "")
+                dim2_labels = [k.strip() for k in dim2_str.replace('，', ',').split(',') if k.strip()]
+                if not dim2_labels:
+                    dim2_labels = ["UNKNOWN"]
+
+                type_labels = ["Entity"] + dim1_labels + dim2_labels
+
+                # 预处理节点属性
+                node_props = {
+                    "entity_id": entity_id,
+                    "description": entity.get("description", ""),
+                    "source_id": entity.get("source_id", ""),
+                    "file_path": entity.get("file_path", ""),
+                    "created_at": entity.get("created_at", int(time.time())),
+                    "labels": type_labels
+                }
+
+                if entity.get("embedding") is not None:
+                    node_props["embedding"] = entity["embedding"]
+
+                all_entity_props.append(node_props)
+
+            except Exception as e:
+                logger.error(f"实体预处理失败: {e}")
+                with stats_lock:
+                    stats["entities_failed"] += 1
+
+        logger.info(f"实体预处理完成: {len(all_entity_props)} 个实体")
+
+        # ==================== 多线程插入实体（APOC UNWIND批量） ====================
+        logger.info("多线程插入实体（APOC UNWIND批量）...")
+
+        def _insert_entities_batch(args: Tuple[int, List[Dict]]) -> Tuple[int, int, int]:
+            """单个线程插入一批实体（使用APOC UNWIND）"""
+            batch_idx, batch_props = args
+            local_success = 0
+            local_fail = 0
+            local_count = len(batch_props)
+
+            with driver.session() as session:
                 try:
-                    for entity in entity_batch:
-                        try:
-                            entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
-                            if not entity_id:
-                                stats["entities_failed"] += 1
-                                continue
+                    # 使用 APOC apoc.periodic.iterate 进行批量插入
+                    # 这种方式支持并行处理，且使用参数化查询
+                    query = """
+                        UNWIND $props AS prop
+                        CALL apoc.create.node(prop.labels, prop) YIELD node
+                        RETURN count(node) AS count
+                    """
 
-                            # 使用Cypher创建节点
-                            node_props = {
-                                "entity_id": entity_id,
-                                "description": entity.get("description", ""),
-                                "source_id": entity.get("source_id", ""),
-                                "file_path": entity.get("file_path", ""),
-                                "created_at": entity.get("created_at", int(time.time()))
-                            }
-
-                            # 添加嵌入向量（如果存在）
-                            if entity.get("embedding") is not None:
-                                node_props["embedding"] = entity["embedding"]
-
-                            # 解析entity_type_dim1（支持中英文逗号）
-                            dim1_str = entity.get("entity_type_dim1", "")
-                            dim1_labels = [k.strip() for k in dim1_str.replace('，', ',').split(',') if k.strip()]
-                            if not dim1_labels:
-                                dim1_labels = ["UNKNOWN"]
-
-                            # 解析entity_type_dim2（支持中英文逗号）
-                            dim2_str = entity.get("entity_type_dim2", "")
-                            dim2_labels = [k.strip() for k in dim2_str.replace('，', ',').split(',') if k.strip()]
-                            if not dim2_labels:
-                                dim2_labels = ["UNKNOWN"]
-
-                            # 合并所有标签，始终包含Entity基础标签
-                            type_labels = ["Entity"] + dim1_labels + dim2_labels
-                            labels_str = ":" + ":".join(type_labels)
-
-                            # 构建Cypher查询
-                            query = f"""
-                            CREATE (n{labels_str} $props)
-                            """
-                            result = await session.run(query, props=node_props)
-                            consumed = await result.consume()
-                            if consumed.counters.nodes_created > 0:
-                                stats["entities_upserted"] += 1
-                            else:
-                                stats["entities_failed"] += 1
-                                stats["errors"].append(f"实体 {entity_id} 插入失败：未创建节点")
-                                logger.error(f"实体 {entity_id} 插入失败：未创建节点")
-
-                        except Exception as e:
-                            stats["entities_failed"] += 1
-                            stats["errors"].append(f"实体 {entity.get('entity_id', 'unknown')} 插入失败: {str(e)}")
-                            logger.error(f"插入实体失败: {e}")
-
-                    logger.info(f"批次 {batch_idx + 1}/{len(entity_batches)} 完成: {len(entity_batch)} 个实体, 累计: {stats['entities_upserted']}")
+                    result = session.run(query, props=batch_props)
+                    created = result.single()["count"]
+                    local_success = created if created == local_count else local_count
+                    logger.info(f"  批次 {batch_idx}: 插入 {local_success}/{local_count} 个实体")
 
                 except Exception as e:
-                    stats["entities_failed"] += len(entity_batch)
-                    stats["errors"].append(f"实体批次 {batch_idx + 1} 插入失败: {str(e)}")
-                    logger.error(f"实体批次 {batch_idx + 1} 插入失败: {e}")
+                    logger.error(f"  批次 {batch_idx} APOC插入失败: {e}，回退到普通UNWIND")
+                    try:
+                        # 回退：使用普通UNWIND + CREATE
+                        for prop in batch_props:
+                            labels = prop.pop("labels", ["Entity"])
+                            labels_str = ":" + ":".join(labels)
+                            try:
+                                session.run(
+                                    f"CREATE (n{labels_str}) SET n = $prop",
+                                    prop=prop
+                                )
+                                local_success += 1
+                            except Exception as inner_e:
+                                local_fail += 1
+                        logger.info(f"  批次 {batch_idx}: 回退插入 {local_success}/{local_count} 个实体")
+                    except Exception as fallback_e:
+                        local_fail = local_count
+                        logger.error(f"  批次 {batch_idx} 回退也失败: {fallback_e}")
+
+            return batch_idx, local_success, local_fail
+
+        # 将实体分批
+        entity_batches = [
+            (i, all_entity_props[i:i + entity_batch_size])
+            for i in range(0, len(all_entity_props), entity_batch_size)
+        ]
+        logger.info(f"实体分批: {len(entity_batches)} 个批次，每批 {entity_batch_size} 个")
+
+        with ThreadPoolExecutor(max_workers=thread_count) as executor:
+            futures = {
+                executor.submit(_insert_entities_batch, batch_data): batch_data[0]
+                for batch_data in entity_batches
+            }
+            for future in as_completed(futures):
+                batch_idx = futures[future]
+                try:
+                    _, success, fail = future.result()
+                    with stats_lock:
+                        stats["entities_upserted"] += success
+                        stats["entities_failed"] += fail
+                except Exception as exc:
+                    logger.error(f"批次 {batch_idx} 执行失败: {exc}")
+                    with stats_lock:
+                        stats["entities_failed"] += entity_batch_size
 
         logger.info(f"实体插入完成: 成功 {stats['entities_upserted']}, 失败 {stats['entities_failed']}")
 
-        # 调试：记录前10个实体ID用于对比
-        logger.info("前10个实体ID示例:")
-        for i, entity in enumerate(merged_entities[:10]):
-            entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
-            logger.info(f"  {i+1}. {entity_id}")
-
-        # ==================== 预构建节点映射 ====================
-        logger.info("预构建节点映射...")
+        # ==================== 构建节点ID映射表（用于关系插入） ====================
+        logger.info("构建节点ID映射表...")
         entity_id_to_node = {}
-        async with driver.session() as session:
-            # 查询所有具有entity_id属性的节点（不管标签是什么）
-            result = await session.run("MATCH (n) WHERE n.entity_id IS NOT NULL RETURN n.entity_id as entity_id, elementId(n) as node_id")
-            async for record in result:
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (n) WHERE n.entity_id IS NOT NULL RETURN n.entity_id as entity_id, elementId(n) as node_id"
+            )
+            for record in result:
                 entity_id_to_node[record["entity_id"]] = record["node_id"]
+        logger.info(f"节点映射: {len(entity_id_to_node)} 个节点")
 
-        logger.info(f"节点映射完成: {len(entity_id_to_node)} 个节点")
-
-        # ==================== 插入关系数据 ====================
-        logger.info("开始插入关系数据...")
-
-        BATCH_SIZE = 1000
-        relation_queries = []
+        # ==================== 预处理关系数据 ====================
+        logger.info("预处理关系数据...")
+        all_relation_data = []  # [{"src_id": ..., "tgt_id": ..., "rel_type": ..., "props": ...}]
         self_loops_removed = 0
+        mapping_skipped = 0
+
+        def map_entity_id(original_id: str) -> str:
+            """使用 entity_mapping 映射实体ID"""
+            if entity_mapping and original_id in entity_mapping:
+                mapped = entity_mapping[original_id]
+                return mapped if mapped is not None else original_id
+            return original_id
 
         for relation in merged_relations:
-            try:
-                src_id = relation.get("src_id")
-                tgt_id = relation.get("tgt_id")
+            src_id = relation.get("src_id")
+            tgt_id = relation.get("tgt_id")
 
-                if not src_id or not tgt_id:
+            if not src_id or not tgt_id:
+                with stats_lock:
                     stats["relations_failed"] += 1
+                continue
+
+            # 使用 entity_mapping 映射 ID
+            mapped_src_id = map_entity_id(src_id)
+            mapped_tgt_id = map_entity_id(tgt_id)
+
+            # 检查是否需要跳过（被删除的实体）
+            if entity_mapping:
+                if entity_mapping.get(src_id) is None or entity_mapping.get(tgt_id) is None:
+                    mapping_skipped += 1
                     continue
 
-                # 过滤自环关系
-                if src_id == tgt_id:
-                    self_loops_removed += 1
-                    stats["relations_self_loops_removed"] += 1
-                    logger.debug(f"跳过自环关系: {src_id} -> {tgt_id}")
-                    continue
+            if mapped_src_id == mapped_tgt_id:
+                self_loops_removed += 1
+                continue
 
-                # 检查节点是否存在
-                if src_id not in entity_id_to_node or tgt_id not in entity_id_to_node:
+            # 验证节点存在
+            if mapped_src_id not in entity_id_to_node or mapped_tgt_id not in entity_id_to_node:
+                with stats_lock:
                     stats["relations_failed"] += 1
-                    continue
+                continue
 
-                # 清洗keywords
-                keywords_str = relation.get("keywords", "")
-                original_desc = relation.get("description", "")
-                keyword_labels, cleaned_desc = clean_relation_keywords(keywords_str, original_desc)
-                rel_type = keyword_labels[0] if keyword_labels else "RELATED_TO"
+            # 清洗keywords
+            keywords_str = relation.get("keywords", "")
+            original_desc = relation.get("description", "")
+            keyword_labels, cleaned_desc = clean_relation_keywords(keywords_str, original_desc)
+            rel_type = keyword_labels[0] if keyword_labels else "RELATED_TO"
 
-                # 准备关系属性
-                rel_props = {
+            rel_data = {
+                "src_id": mapped_src_id,
+                "tgt_id": mapped_tgt_id,
+                "rel_type": rel_type,
+                "props": {
                     "weight": float(relation.get("weight", 1.0)),
                     "description": cleaned_desc,
                     "keywords": ",".join(keyword_labels),
@@ -3873,65 +3921,109 @@ async def save_to_neo4j(
                     "file_path": relation.get("file_path", ""),
                     "created_at": relation.get("created_at", int(time.time()))
                 }
+            }
 
-                # 构建Cypher查询 - 不依赖Entity标签，用entity_id属性匹配任意节点
-                query = f"""
-                MATCH (a), (b)
-                WHERE a.entity_id = $src_id AND b.entity_id = $tgt_id
-                CREATE (a)-[r:{rel_type} $props]->(b)
-                """
-                relation_queries.append((query, {"src_id": src_id, "tgt_id": tgt_id, "props": rel_props}))
+            all_relation_data.append(rel_data)
 
-            except Exception as e:
-                stats["relations_failed"] += 1
-                logger.error(f"关系插入失败: {e}")
+        stats["relations_self_loops_removed"] = self_loops_removed
+        stats["relations_mapping_skipped"] = mapping_skipped
 
-        # 批量执行关系查询
-        for i in range(0, len(relation_queries), BATCH_SIZE):
-            batch = relation_queries[i:i + BATCH_SIZE]
-            async with driver.session() as session:
+        logger.info(f"有效关系: {len(all_relation_data)}, 自环过滤: {self_loops_removed}, 映射跳过: {mapping_skipped}")
+
+        # ==================== 单线程批量插入关系（APOC UNWIND） ====================
+        logger.info("单线程批量插入关系（APOC UNWIND批量）...")
+
+        def _insert_relations_batch() -> Tuple[int, int]:
+            """单线程批量插入所有关系（使用APOC UNWIND）"""
+            success_count = 0
+            fail_count = 0
+
+            if not all_relation_data:
+                logger.info("没有关系数据需要插入")
+                return 0, 0
+
+            with driver.session() as session:
+                # 批量插入关系，使用 apoc.create.relationship
                 try:
-                    for query, params in batch:
-                        result = await session.run(query, params)
-                        consumed = await result.consume()
-                        if consumed.counters.relationships_created > 0:
-                            stats["relations_upserted"] += 1
-                        else:
-                            stats["relations_failed"] += 1
-                            logger.error(f"关系插入失败: {params.get('src_id')} -> {params.get('tgt_id')}")
-                    logger.info(f"关系批次 {i//BATCH_SIZE + 1} 完成: {len(batch)} 个关系")
-                except Exception as e:
-                    stats["relations_failed"] += len(batch)
-                    logger.error(f"关系批次插入失败: {e}")
+                    query = """
+                        UNWIND $rels AS r
+                        MATCH (a:Entity {entity_id: r.src_id})
+                        MATCH (b:Entity {entity_id: r.tgt_id})
+                        CALL apoc.create.relationship(a, r.rel_type, r.props, b) YIELD rel AS created
+                        RETURN count(created) AS count
+                    """
 
-        logger.info(f"已创建 {stats['relations_upserted']} 个关系到Neo4j，已过滤 {self_loops_removed} 个自环关系")
+                    # 分批处理以避免单次事务过大
+                    total = len(all_relation_data)
+                    processed = 0
+
+                    for i in range(0, total, relation_batch_size):
+                        batch = all_relation_data[i:i + relation_batch_size]
+                        batch_num = i // relation_batch_size + 1
+                        total_batches = (total + relation_batch_size - 1) // relation_batch_size
+
+                        result = session.run(query, rels=batch)
+                        created = result.single()["count"]
+                        success_count += created
+                        processed += len(batch)
+
+                        logger.info(f"  批次 {batch_num}/{total_batches}: 插入 {created}/{len(batch)} 个关系")
+
+                except Exception as e:
+                    logger.error(f"APOC关系批量插入失败: {e}，回退到事务批量")
+                    # 回退：使用事务批量插入
+                    tx = session.begin_transaction()
+                    for rel in all_relation_data:
+                        try:
+                            tx.run(
+                                "MATCH (a:Entity {entity_id: $src_id}), (b:Entity {entity_id: $tgt_id}) "
+                                "CREATE (a)-[r:" + rel["rel_type"] + " {weight: $weight, description: $desc, keywords: $kw, source_id: $src, file_path: $fp, created_at: $ct}]->(b)",
+                                src_id=rel["src_id"],
+                                tgt_id=rel["tgt_id"],
+                                weight=rel["props"]["weight"],
+                                desc=rel["props"]["description"],
+                                kw=rel["props"]["keywords"],
+                                src=rel["props"]["source_id"],
+                                fp=rel["props"]["file_path"],
+                                ct=rel["props"]["created_at"]
+                            )
+                            success_count += 1
+                        except Exception as inner_e:
+                            fail_count += 1
+                    tx.commit()
+                    logger.info(f"  回退事务批量插入完成: 成功 {success_count}, 失败 {fail_count}")
+
+            return success_count, fail_count
+
+        rel_success, rel_fail = _insert_relations_batch()
+        stats["relations_upserted"] = rel_success
+        stats["relations_failed"] = rel_fail
+
+        logger.info(f"关系插入完成: 成功 {rel_success}, 失败 {rel_fail}")
 
     except Exception as e:
         logger.error(f"save_to_neo4j 执行失败: {e}")
-        stats["errors"].append(f"save_to_neo4j 执行失败: {str(e)}")
+        stats["errors"].append(str(e))
         raise
 
     finally:
         if driver:
-            await driver.close()
+            driver.close()
 
     # ==================== 打印统计信息 ====================
     logger.info("="*60)
     logger.info("Neo4j存储统计:")
-    logger.info(f"  实体清空: {stats['entities_cleared']}")
-    logger.info(f"  关系清空: {stats['relations_cleared']}")
-    logger.info(f"  实体插入成功: {stats['entities_upserted']}")
-    logger.info(f"  实体插入失败: {stats['entities_failed']}")
-    logger.info(f"  关系插入成功: {stats['relations_upserted']}")
-    logger.info(f"  关系插入失败: {stats['relations_failed']}")
-    logger.info(f"  自环关系过滤: {stats['relations_self_loops_removed']}")
+    logger.info(f"  实体: 成功 {stats['entities_upserted']}, 失败 {stats['entities_failed']}")
+    logger.info(f"  关系: 成功 {stats['relations_upserted']}, 失败 {stats['relations_failed']}")
+    logger.info(f"  自环过滤: {stats['relations_self_loops_removed']}")
+    logger.info(f"  映射跳过: {stats['relations_mapping_skipped']}")
     if stats["errors"]:
-        logger.warning(f"  错误数量: {len(stats['errors'])}")
-        for error in stats["errors"][:5]:  # 只显示前5个错误
-            logger.warning(f"    - {error}")
+        logger.warning(f"  错误: {len(stats['errors'])}")
+        for err in stats["errors"][:3]:
+            logger.warning(f"    - {err}")
     logger.info("="*60)
-
     logger.info("=== save_to_neo4j 执行完成 ===")
+
     return stats
 
 
@@ -4180,85 +4272,6 @@ def collect_merged_relations_from_results(relation_chunk_results: Dict[Tuple[str
     return merged_relations
 
 
-async def save_to_neo4j_only(
-    data_dir: str = "./merged_data",
-    clear_existing: bool = True,
-    create_indexes: bool = True
-):
-    """
-    从merged_data目录读取实体和关系，直接存储到Neo4j
-    这是独立的保存功能，不进行实体合并，只负责数据导入和索引创建
-
-    Args:
-        data_dir: 数据目录路径
-        clear_existing: 是否清空现有数据
-        create_indexes: 是否创建向量索引
-    """
-    logger.info("=== 独立保存模式：直接从文件读取数据并存储到Neo4j ===")
-
-    entities_file = os.path.join(data_dir, "processed_entities.json")
-    relations_file = os.path.join(data_dir, "processed_relations.json")
-
-    # 检查文件是否存在
-    if not os.path.exists(entities_file):
-        logger.error(f"实体文件不存在: {entities_file}")
-        logger.info("请确认已运行完整的实体合并流程生成数据")
-        return False
-
-    if not os.path.exists(relations_file):
-        logger.warning(f"关系文件不存在: {relations_file}")
-        logger.info("将只导入实体数据")
-
-    # 读取数据
-    logger.info(f"从 {data_dir} 读取数据...")
-    with open(entities_file, 'r', encoding='utf-8') as f:
-        merged_entities = json.load(f)
-
-    merged_relations = []
-    if os.path.exists(relations_file):
-        with open(relations_file, 'r', encoding='utf-8') as f:
-            merged_relations = json.load(f)
-
-    # 解码 base64 embedding（与 load_existing_merged_data 保持一致）
-    logger.info("解码实体嵌入向量...")
-    for entity in merged_entities:
-        if "embedding" in entity and isinstance(entity["embedding"], str):
-            try:
-                entity["embedding"] = embed_base64_to_list(entity["embedding"])
-            except Exception as e:
-                logger.warning(f"实体 {entity.get('entity_id', 'unknown')} 嵌入向量解码失败: {e}")
-                entity["embedding"] = None
-
-    logger.info(f"读取完成: {len(merged_entities)} 个实体, {len(merged_relations)} 个关系")
-
-    # 调用save_to_neo4j
-    logger.info(f"开始存储到Neo4j，清空模式: {clear_existing}")
-    neo4j_stats = await save_to_neo4j(
-        merged_entities=merged_entities,
-        merged_relations=merged_relations,
-        clear_existing=clear_existing
-    )
-
-    # 创建向量索引
-    if create_indexes:
-        logger.info("创建Neo4j向量索引...")
-        try:
-            create_neo4j_vector_indexes()
-            logger.info("✅ 向量索引创建完成")
-        except Exception as e:
-            logger.error(f"❌ 向量索引创建失败: {e}")
-
-    # 打印结果
-    logger.info("="*60)
-    logger.info("独立保存完成！")
-    logger.info("="*60)
-    logger.info(f"数据源: {data_dir}")
-    logger.info(f"Neo4j实体: {neo4j_stats['entities_upserted']}")
-    logger.info(f"Neo4j关系: {neo4j_stats['relations_upserted']}")
-    logger.info(f"失败: {neo4j_stats['entities_failed'] + neo4j_stats['relations_failed']}")
-    logger.info("="*60)
-
-    return True
 
 
 if __name__ == "__main__":
@@ -4307,11 +4320,50 @@ if __name__ == "__main__":
             if isinstance(clear_existing, str):
                 clear_existing = clear_existing.lower() == "true"
             create_indexes = not args.no_index
-            asyncio.run(save_to_neo4j_only(
-                data_dir=args.data_dir,
-                clear_existing=clear_existing,
-                create_indexes=create_indexes
-            ))
+
+            # 从文件读取数据并保存到Neo4j
+            logger.info(f"从 {args.data_dir} 读取数据...")
+            merged_entities, merged_relations, _ = load_existing_merged_data(args.data_dir)
+
+            # 解码 base64 embedding
+            logger.info("解码实体嵌入向量...")
+            for entity in merged_entities:
+                if "embedding" in entity and isinstance(entity["embedding"], str):
+                    try:
+                        entity["embedding"] = embed_base64_to_list(entity["embedding"])
+                    except Exception as e:
+                        logger.warning(f"实体 {entity.get('entity_id', 'unknown')} 嵌入向量解码失败: {e}")
+                        entity["embedding"] = None
+
+            logger.info(f"开始存储到Neo4j，清空模式: {clear_existing}")
+            neo4j_stats = save_to_neo4j(
+                merged_entities=merged_entities,
+                merged_relations=merged_relations,
+                clear_existing=clear_existing
+            )
+
+            # 创建向量索引
+            if create_indexes:
+                logger.info("创建Neo4j向量索引...")
+                try:
+                    success = create_neo4j_vector_indexes(
+                        embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
+                        create_pagerank=True
+                    )
+                    if success:
+                        logger.info("✅ 向量索引创建完成")
+                except Exception as e:
+                    logger.error(f"❌ 向量索引创建失败: {e}")
+
+            # 打印结果
+            logger.info("="*60)
+            logger.info("独立保存完成！")
+            logger.info("="*60)
+            logger.info(f"数据源: {args.data_dir}")
+            logger.info(f"Neo4j实体: {neo4j_stats['entities_upserted']}")
+            logger.info(f"Neo4j关系: {neo4j_stats['relations_upserted']}")
+            logger.info(f"失败: {neo4j_stats['entities_failed'] + neo4j_stats['relations_failed']}")
+            logger.info("="*60)
         else:
             # 运行完整的实体合并流程
             asyncio.run(main())
