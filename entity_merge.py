@@ -3116,8 +3116,6 @@ def chunk_relations_by_merge_groups(relations: List[Dict[str, Any]], entity_mapp
         processed_relation = relation.copy()
         processed_relation["src_id"] = src_final
         processed_relation["tgt_id"] = tgt_final
-        processed_relation["original_src_id"] = src_id  # 保留原始ID用于调试
-        processed_relation["original_tgt_id"] = tgt_id  # 保留原始ID用于调试
 
         relation_chunks[chunk_key].append(processed_relation)
         processed_relations += 1
@@ -3850,7 +3848,17 @@ def save_to_neo4j(
 
         logger.info(f"实体插入完成: 成功 {stats['entities_upserted']}, 失败 {stats['entities_failed']}")
 
+        # ==================== 建立有效实体ID集合（从merged_entities，不依赖entity_mapping） ====================
+        logger.info("建立有效实体ID集合...")
+        valid_entity_ids = set()
+        for entity in merged_entities:
+            entity_id = entity.get("entity_id") or entity.get("id")
+            if entity_id:
+                valid_entity_ids.add(entity_id)
+        logger.info(f"有效实体ID: {len(valid_entity_ids)} 个")
+
         # ==================== 构建节点ID映射表（用于关系插入） ====================
+
         logger.info("构建节点ID映射表...")
         entity_id_to_node = {}
         with driver.session() as session:
@@ -3865,14 +3873,8 @@ def save_to_neo4j(
         logger.info("预处理关系数据...")
         all_relation_data = []  # [{"src_id": ..., "tgt_id": ..., "rel_type": ..., "props": ...}]
         self_loops_removed = 0
-        mapping_skipped = 0
-
-        def map_entity_id(original_id: str) -> str:
-            """使用 entity_mapping 映射实体ID"""
-            if entity_mapping and original_id in entity_mapping:
-                mapped = entity_mapping[original_id]
-                return mapped if mapped is not None else original_id
-            return original_id
+        not_found_src = 0
+        not_found_tgt = 0
 
         for relation in merged_relations:
             src_id = relation.get("src_id")
@@ -3883,22 +3885,23 @@ def save_to_neo4j(
                     stats["relations_failed"] += 1
                 continue
 
-            # 使用 entity_mapping 映射 ID
-            mapped_src_id = map_entity_id(src_id)
-            mapped_tgt_id = map_entity_id(tgt_id)
-
-            # 检查是否需要跳过（被删除的实体）
-            if entity_mapping:
-                if entity_mapping.get(src_id) is None or entity_mapping.get(tgt_id) is None:
-                    mapping_skipped += 1
-                    continue
-
-            if mapped_src_id == mapped_tgt_id:
+            # 跳过自环
+            if src_id == tgt_id:
                 self_loops_removed += 1
                 continue
 
-            # 验证节点存在
-            if mapped_src_id not in entity_id_to_node or mapped_tgt_id not in entity_id_to_node:
+            # 检查端点实体是否存在于Neo4j中
+            # 优先检查 entity_id_to_node（已插入的节点）
+            # 其次检查 valid_entity_ids（已合并的实体）
+            if src_id not in entity_id_to_node and src_id not in valid_entity_ids:
+                not_found_src += 1
+                logger.warning(src_id)
+                with stats_lock:
+                    stats["relations_failed"] += 1
+                continue
+
+            if tgt_id not in entity_id_to_node and tgt_id not in valid_entity_ids:
+                not_found_tgt += 1
                 with stats_lock:
                     stats["relations_failed"] += 1
                 continue
@@ -3907,11 +3910,11 @@ def save_to_neo4j(
             keywords_str = relation.get("keywords", "")
             original_desc = relation.get("description", "")
             keyword_labels, cleaned_desc = clean_relation_keywords(keywords_str, original_desc)
-            rel_type = keyword_labels[0] if keyword_labels else "RELATED_TO"
+            rel_type = "RELATED_TO"
 
             rel_data = {
-                "src_id": mapped_src_id,
-                "tgt_id": mapped_tgt_id,
+                "src_id": src_id,
+                "tgt_id": tgt_id,
                 "rel_type": rel_type,
                 "props": {
                     "weight": float(relation.get("weight", 1.0)),
@@ -3926,9 +3929,8 @@ def save_to_neo4j(
             all_relation_data.append(rel_data)
 
         stats["relations_self_loops_removed"] = self_loops_removed
-        stats["relations_mapping_skipped"] = mapping_skipped
 
-        logger.info(f"有效关系: {len(all_relation_data)}, 自环过滤: {self_loops_removed}, 映射跳过: {mapping_skipped}")
+        logger.info(f"有效关系: {len(all_relation_data)}, 自环过滤: {self_loops_removed}, 端点不存在: {not_found_src + not_found_tgt}")
 
         # ==================== 单线程批量插入关系（APOC UNWIND） ====================
         logger.info("单线程批量插入关系（APOC UNWIND批量）...")
