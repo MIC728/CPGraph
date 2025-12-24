@@ -3624,7 +3624,7 @@ async def main():
         logger.info("创建向量索引")
         logger.info("=" * 60)
 
-        create_vector_indexes_success = create_neo4j_vector_indexes(
+        create_vector_indexes_success = await create_neo4j_vector_indexes(
             embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
             create_pagerank=True
         )
@@ -3961,7 +3961,6 @@ def save_to_neo4j(
             # 其次检查 valid_entity_ids（已合并的实体）
             if src_id not in entity_id_to_node and src_id not in valid_entity_ids:
                 not_found_src += 1
-                logger.warning(src_id)
                 with stats_lock:
                     stats["relations_failed"] += 1
                 continue
@@ -4369,10 +4368,10 @@ if __name__ == "__main__":
 
             # 直接创建向量索引
             try:
-                create_vector_indexes_success = create_neo4j_vector_indexes(
+                create_vector_indexes_success = asyncio.run(create_neo4j_vector_indexes(
                     embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
                     create_pagerank=True
-                )
+                ))
 
                 if create_vector_indexes_success:
                     logger.info("✅ 向量索引创建成功")
@@ -4414,10 +4413,10 @@ if __name__ == "__main__":
             if create_indexes:
                 logger.info("创建Neo4j向量索引...")
                 try:
-                    success = create_neo4j_vector_indexes(
+                    success = asyncio.run(create_neo4j_vector_indexes(
                         embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
                         create_pagerank=True
-                    )
+                    ))
                     if success:
                         logger.info("✅ 向量索引创建完成")
                 except Exception as e:
