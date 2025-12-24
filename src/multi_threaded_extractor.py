@@ -38,11 +38,20 @@ def get_default_tokenizer():
 
 # 配置日志 - 复用LightRAG logger
 log_level = get_env_value("LOG_LEVEL", "INFO", str).upper()
+# 是否启用文件日志（默认为true）
+enable_file_logging = get_env_value("LOG_FILE_ENABLE", "true", str).lower() == "true"
+# 日志文件路径（默认使用 LOG_DIR + cprag.log）
+log_file_path = None
+if enable_file_logging:
+    log_dir = get_env_value("LOG_DIR", ".", str)
+    log_file_path = os.path.abspath(os.path.join(log_dir, "cprag.log"))
+
 setup_logger(
     logger_name="CPGraph",
     level=log_level,
     add_filter=False,
-    enable_file_logging=False  # Console only, matching original behavior
+    log_file_path=log_file_path,
+    enable_file_logging=enable_file_logging
 )
 logger = logging.getLogger("CPGraph")
 

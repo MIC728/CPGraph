@@ -35,11 +35,20 @@ from lightrag.utils import setup_logger, get_env_value
 # Configure logger using LightRAG's standard setup_logger
 # This ensures all LOG_* environment variables are properly respected
 log_level = get_env_value("LOG_LEVEL", "INFO", str).upper()
+# 是否启用文件日志（默认为true）
+enable_file_logging = get_env_value("LOG_FILE_ENABLE", "true", str).lower() == "true"
+# 日志文件路径（默认使用 LOG_DIR + cprag.log）
+log_file_path = None
+if enable_file_logging:
+    log_dir = get_env_value("LOG_DIR", ".", str)
+    log_file_path = os.path.abspath(os.path.join(log_dir, "cprag.log"))
+
 setup_logger(
     logger_name="CPGraph",
     level=log_level,
     add_filter=False,
-    enable_file_logging=False
+    log_file_path=log_file_path,
+    enable_file_logging=enable_file_logging
 )
 logger = logging.getLogger("CPGraph")
 
@@ -159,7 +168,7 @@ def merge_with_existing_data(
 
     # 先加载已有实体
     for entity in existing_entities:
-        entity_id = entity.get("entity_id") or entity.get("id")
+        entity_id = entity.get("entity_id")
         if entity_id:
             entity_map[entity_id] = entity
 
@@ -169,7 +178,7 @@ def merge_with_existing_data(
     new_count = 0
     update_count = 0
     for entity in new_entities:
-        entity_id = entity.get("entity_id") or entity.get("id")
+        entity_id = entity.get("entity_id")
         if entity_id:
             if entity_id in entity_map:
                 update_count += 1
@@ -455,12 +464,12 @@ class EntityDataLoader:
         entity_indices = []  # 记录对应的实体在 self.entities 中的索引
 
         entity_id_to_idx = {
-            e.get("entity_id") or e.get("id"): i
+            e.get("entity_id"): i
             for i, e in enumerate(self.entities)
         }
 
         for entity in entities_without_embedding:
-            entity_id = entity.get("entity_id") or entity.get("id") or ""
+            entity_id = entity.get("entity_id") or ""
             description = entity.get("description", "")
             # 构造嵌入文本：实体名 + 描述
             text = f"{entity_id}\n{description}".strip()
@@ -620,7 +629,7 @@ class EntityDataLoader:
         for entity in entities:
             try:
                 # 确保必要的字段存在
-                entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
+                entity_id = entity.get("entity_id") or entity.get("entity_name", "")
                 
                 if not entity_id:
                     logger.warning(f"跳过无ID的实体: {entity}")
@@ -629,7 +638,6 @@ class EntityDataLoader:
                 # 保持原始格式，只保留核心字段
                 standardized_entity = {
                     "entity_id": entity_id,
-                    "id": entity.get("id", entity_id),
                     "entity_type_dim1": entity.get("entity_type_dim1", ""),
                     "entity_type_dim2": entity.get("entity_type_dim2", ""),
                     "description": entity.get("description", ""),
@@ -1136,9 +1144,17 @@ def process_problem_entities_chunk(
             main_entity['entity_type_dim1'] = ','.join(sorted(all_dim1_types))
             main_entity['entity_type_dim2'] = ','.join(sorted(all_dim2_types))
 
-            # 记录合并信息
-            main_entity['merged_from'] = group
-            main_entity['merge_count'] = len(group)
+            # 记录合并信息（merged_from是参与合并的所有实体的最原始ID）
+            all_merged_from = []
+            for entity in group_entities:
+                # 追溯实体的最原始ID（merged_from的第一个元素，或实体自身ID）
+                entity_merged_from = entity.get('merged_from', [])
+                if entity_merged_from:
+                    all_merged_from.append(entity_merged_from[0])  # 最原始ID
+                else:
+                    all_merged_from.append(entity.get('entity_id'))
+            main_entity['merged_from'] = all_merged_from
+            main_entity['merge_count'] = len(all_merged_from)
             main_entity['merge_timestamp'] = int(time.time())
             main_entity['merge_method'] = 'fast_concat'  # 标记为快速拼接合并
 
@@ -1482,7 +1498,7 @@ async def call_entity_evaluation_llm(
         logger.debug(f"实体 {entity_id} 描述已截断到200字符")
 
     current_entity_json = json.dumps({
-        "id": entity_id,
+        "entity_id": entity_id,
         "type_dim1": current_entity.get("entity_type_dim1", "UNKNOWN"),
         "type_dim2": current_entity.get("entity_type_dim2", "UNKNOWN"),
         "description": current_description
@@ -1496,7 +1512,7 @@ async def call_entity_evaluation_llm(
             desc = desc[:200]
             logger.debug(f"相似实体 {e.get('entity_id', '')} 描述已截断到200字符")
         similar_entities_data.append({
-            "id": e.get("entity_id", ""),
+            "entity_id": e.get("entity_id", ""),
             "type_dim1": e.get("entity_type_dim1", "UNKNOWN"),
             "type_dim2": e.get("entity_type_dim2", "UNKNOWN"),
             "description": desc
@@ -1571,7 +1587,7 @@ async def call_entity_group_merge_llm(
     # 构建输入JSON - 保留完整ID（带随机ID）
     entities_json = json.dumps([
         {
-            "id": e.get("entity_id", ""),
+            "entity_id": e.get("entity_id", ""),
             "type_dim1": e.get("entity_type_dim1", "UNKNOWN"),
             "type_dim2": e.get("entity_type_dim2", "UNKNOWN"),
             "description": e.get("description", "")
@@ -1762,7 +1778,9 @@ async def reclassify_unknown_entities(
 
                 # 更新实体信息
                 updated_entity = entity.copy()
-                updated_entity["entity_id"] = result.get("corrected_name", entity_id)
+                old_entity_id = entity_id  # 保存旧ID用于映射
+                new_entity_id = result.get("corrected_name", entity_id)
+                updated_entity["entity_id"] = new_entity_id
                 updated_entity["entity_type_dim1"] = result.get("type_dim1", "其他")
                 updated_entity["entity_type_dim2"] = result.get("type_dim2", "概念")
 
@@ -1770,6 +1788,13 @@ async def reclassify_unknown_entities(
                 cleaned_desc = result.get("cleaned_description")
                 if cleaned_desc:
                     updated_entity["description"] = cleaned_desc
+
+                # 记录旧ID到merged_from（用于后续实体映射）
+                # 始终记录，无论ID是否改变，确保所有经过重分类的实体都能被正确映射
+                updated_entity["merged_from"] = [old_entity_id]
+                updated_entity["merge_count"] = 1
+                updated_entity["merge_timestamp"] = int(time.time())
+                updated_entity["merge_method"] = "clean_reclassify"
 
                 if updated_entity["entity_id"] != entity_id or updated_entity["entity_type_dim1"] != entity.get("entity_type_dim1"):
                     logger.info(f"  重分类: {entity_id} -> {updated_entity['entity_id']}, 类型: {updated_entity['entity_type_dim1']}/{updated_entity['entity_type_dim2']}")
@@ -1950,9 +1975,16 @@ def merge_entity_group(group: List[str], entities_dict: Dict[str, Dict[str, Any]
     # 更新创建时间
     main_entity['created_at'] = group_entities[0].get('created_at', int(time.time()))
 
-    # 记录合并信息
-    main_entity['merged_from'] = group
-    main_entity['merge_count'] = len(group_entities)
+    # 记录合并信息（收集所有实体的最原始ID）
+    all_merged_from = []
+    for entity in group_entities:
+        entity_merged_from = entity.get('merged_from', [])
+        if entity_merged_from:
+            all_merged_from.append(entity_merged_from[0])
+        else:
+            all_merged_from.append(entity.get('entity_id'))
+    main_entity['merged_from'] = all_merged_from
+    main_entity['merge_count'] = len(all_merged_from)
     main_entity['merge_timestamp'] = int(time.time())
 
     # 为合并后的实体生成新的嵌入向量
@@ -2095,9 +2127,16 @@ async def merge_entity_group_async(group: List[str], entities_dict: Dict[str, Di
     # 更新创建时间
     main_entity['created_at'] = group_entities[0].get('created_at', int(time.time()))
 
-    # 记录合并信息
-    main_entity['merged_from'] = group
-    main_entity['merge_count'] = len(group_entities)
+    # 记录合并信息（收集所有实体的最原始ID）
+    all_merged_from = []
+    for entity in group_entities:
+        entity_merged_from = entity.get('merged_from', [])
+        if entity_merged_from:
+            all_merged_from.append(entity_merged_from[0])
+        else:
+            all_merged_from.append(entity.get('entity_id'))
+    main_entity['merged_from'] = all_merged_from
+    main_entity['merge_count'] = len(all_merged_from)
     main_entity['merge_timestamp'] = int(time.time())
 
     # 为合并后的实体生成新的嵌入向量
@@ -2173,9 +2212,9 @@ def process_entity_chunk(chunk_name: str, entities: List[Dict[str, Any]]) -> Dic
     entities_map = dict()
     entities_dict = dict()
     for entity in entities:
-        id = entity.get('entity_id')
-        entities_map[id] = id
-        entities_dict[id] = entity
+        entity_id = entity.get('entity_id')
+        entities_map[entity_id] = entity_id
+        entities_dict[entity_id] = entity
     logger.info(f"分块 '{chunk_name}' 向量索引初始化完成，包含 {len(entities_with_embeddings)} 个实体")
     
     # 完成实体对齐
@@ -2713,9 +2752,15 @@ async def process_entity_chunk_with_llm(
 
     merged_entities = []
 
-    # 处理单实体组（无需处理，直接保留）
+    # 处理单实体组（确保每个实体都有merged_from字段用于映射）
     for root_id, group in single_entity_groups:
         entity = entities_dict[group[0]].copy()
+        # 如果实体已经有merged_from（清洗过程设置的），保留它
+        if "merged_from" not in entity:
+            entity["merged_from"] = [group[0]]
+            entity["merge_count"] = 1
+            entity["merge_timestamp"] = int(time.time())
+            entity["merge_method"] = "single_entity"
         merged_entities.append(entity)
 
     # 处理小合并组（直接拼接，无需LLM）
@@ -2754,9 +2799,17 @@ async def process_entity_chunk_with_llm(
             if descriptions:
                 main_entity['description'] = GRAPH_FIELD_SEP.join(descriptions)
 
-            # 记录合并信息
-            main_entity['merged_from'] = group
-            main_entity['merge_count'] = len(group)
+            # 记录合并信息（merged_from是参与合并的所有实体的最原始ID）
+            all_merged_from = []
+            for entity in group_entities:
+                # 追溯实体的最原始ID
+                entity_merged_from = entity.get('merged_from', [])
+                if entity_merged_from:
+                    all_merged_from.append(entity_merged_from[0])
+                else:
+                    all_merged_from.append(entity.get('entity_id'))
+            main_entity['merged_from'] = all_merged_from
+            main_entity['merge_count'] = len(all_merged_from)
             main_entity['merge_timestamp'] = int(time.time())
             main_entity['merge_method'] = 'direct_concat'  # 标记为直接拼接合并
 
@@ -2793,8 +2846,17 @@ async def process_entity_chunk_with_llm(
                 main_entity["entity_type_dim1"] = merge_result["final_type_dim1"]
                 main_entity["entity_type_dim2"] = merge_result["final_type_dim2"]
                 main_entity["description"] = merge_result["final_description"]
-                main_entity["merged_from"] = group
-                main_entity["merge_count"] = len(group)
+
+                # 收集参与合并的所有实体的最原始ID
+                all_merged_from = []
+                for entity in group_entities:
+                    entity_merged_from = entity.get('merged_from', [])
+                    if entity_merged_from:
+                        all_merged_from.append(entity_merged_from[0])
+                    else:
+                        all_merged_from.append(entity.get('entity_id'))
+                main_entity["merged_from"] = all_merged_from
+                main_entity["merge_count"] = len(all_merged_from)
                 main_entity["merge_timestamp"] = int(time.time())
                 main_entity["merge_method"] = 'llm_merge'  # 标记为LLM合并
 
@@ -3013,18 +3075,18 @@ def build_entity_merge_mapping(
     """
     entity_mapping = {}
 
-    for chunk_name, result in chunk_results.items():
-        if result.get("status") != "processed":
-            continue
-
-        # 获取当前分块的实体ID映射
-        chunk_mapping = result.get("entity_id_mapping", {})
-        entity_mapping.update(chunk_mapping)
-
-        # 统计信息
-        deleted_count = sum(1 for v in chunk_mapping.values() if v is None)
-        renamed_count = sum(1 for k, v in chunk_mapping.items() if v is not None and k != v)
-        logger.info(f"分块 '{chunk_name}': {len(chunk_mapping)} 个映射, {deleted_count} 个删除, {renamed_count} 个重命名/合并")
+    # for chunk_name, result in chunk_results.items():
+    #     if result.get("status") != "processed":
+    #         continue
+    #
+    #     # 获取当前分块的实体ID映射
+    #     chunk_mapping = result.get("entity_id_mapping", {})
+    #     entity_mapping.update(chunk_mapping)
+    #
+    #     # 统计信息
+    #     deleted_count = sum(1 for v in chunk_mapping.values() if v is None)
+    #     renamed_count = sum(1 for k, v in chunk_mapping.items() if v is not None and k != v)
+    #     logger.info(f"分块 '{chunk_name}': {len(chunk_mapping)} 个映射, {deleted_count} 个删除, {renamed_count} 个重命名/合并")
 
     # 补充映射：建立完整的实体ID映射关系
     if all_entities:
@@ -3033,7 +3095,7 @@ def build_entity_merge_mapping(
         merged_count = 0
 
         for entity in all_entities:
-            entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
+            entity_id = entity.get("entity_id") or entity.get("entity_name", "")
             if not entity_id:
                 continue
 
@@ -3736,7 +3798,7 @@ def save_to_neo4j(
 
         for entity in merged_entities:
             try:
-                entity_id = entity.get("entity_id") or entity.get("id") or entity.get("entity_name", "")
+                entity_id = entity.get("entity_id") or entity.get("entity_name", "")
                 if not entity_id:
                     continue
 
@@ -3848,13 +3910,17 @@ def save_to_neo4j(
 
         logger.info(f"实体插入完成: 成功 {stats['entities_upserted']}, 失败 {stats['entities_failed']}")
 
-        # ==================== 建立有效实体ID集合（从merged_entities，不依赖entity_mapping） ====================
+        # ==================== 建立有效实体ID集合（包含新ID和旧ID） ====================
         logger.info("建立有效实体ID集合...")
         valid_entity_ids = set()
         for entity in merged_entities:
-            entity_id = entity.get("entity_id") or entity.get("id")
+            entity_id = entity.get("entity_id")
             if entity_id:
                 valid_entity_ids.add(entity_id)
+            # 同时添加merged_from中的旧ID，确保重分类/合并前的实体ID也能被识别
+            merged_from = entity.get("merged_from", [])
+            for old_id in merged_from:
+                valid_entity_ids.add(old_id)
         logger.info(f"有效实体ID: {len(valid_entity_ids)} 个")
 
         # ==================== 构建节点ID映射表（用于关系插入） ====================
