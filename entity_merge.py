@@ -2321,8 +2321,8 @@ async def process_entity_chunk_with_llm(
     entity_types_dim2: List[str] = None,
     topk: int = None,
     max_concurrent: int = None,
-    high_similarity_threshold: float = 0.85,
-    low_similarity_threshold: float = 0.6,
+    high_similarity_threshold: float = 1.0,
+    low_similarity_threshold: float = 0.0,
     problem_similarity_threshold: float = 0.8,
     small_merge_threshold: int = 4
 ) -> Dict[str, Any]:

@@ -320,10 +320,10 @@ class KGQueryService:
         # 构建子图并计算度数
         query = """
         UNWIND $candidate_ids as target_id
-        MATCH (n:Entity {entity_id: target_id})
+        MATCH (n {entity_id: target_id})
         WITH target_id, n
 
-        MATCH (n)-[r]-(neighbor:Entity)
+        MATCH (n)-[r]-(neighbor)
         WHERE neighbor.entity_id IN $candidate_ids
         WITH target_id, count(DISTINCT neighbor) as degree
 
@@ -396,7 +396,7 @@ class KGQueryService:
         try:
             # 直接查询候选实体的 PageRank 值（已预先计算并存储在节点属性中）
             query = """
-            MATCH (e:Entity)
+            MATCH (e)
             WHERE e.entity_id IN $candidate_ids
             RETURN e.entity_id as entity_id, e.pagerank as pagerank
             ORDER BY e.pagerank DESC
@@ -507,7 +507,7 @@ class KGQueryService:
         try:
             # 查询实体的 source_id 属性（包含关联的 chunk IDs）
             cypher = """
-            MATCH (e:Entity {entity_id: $entity_id})
+            MATCH (e {entity_id: $entity_id})
             RETURN e.source_id as source_id
             LIMIT 1
             """
@@ -741,7 +741,7 @@ JSON数组，每行包含查询结果记录
 
 查询与Splay树相关的技巧有哪些：
 {
-  "query": "CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector) YIELD node as splay_node WHERE '数据结构' IN labels(splay_node) MATCH (splay_node)-[r]-(technique:Entity) WHERE '技巧' IN labels(technique) RETURN technique.entity_id as entity_name, technique.description as description, [label IN labels(technique) WHERE NOT label = 'Entity'] as labels, technique.file_path as file_path, r.weight as weight, splay_node.entity_id as related_to ORDER BY weight DESC",
+  "query": "CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector) YIELD node as splay_node WHERE '数据结构' IN labels(splay_node) MATCH (splay_node)-[r:RELATED_TO]-(technique) WHERE '技巧' IN labels(technique) RETURN technique.entity_id as entity_name, technique.description as description, labels(technique) as labels, technique.file_path as file_path, r.weight as weight, r.keywords as relationship_type, splay_node.entity_id as related_to ORDER BY weight DESC",
   "parameters": {"query_vector": "Splay树，一种平衡二叉查找树"},
   "vector_params": {"query_vector": true},
   "limit": 20
@@ -749,6 +749,7 @@ JSON数组，每行包含查询结果记录
 
 1. 过滤出"数据结构"类型的节点
 2. 查找这些节点的邻居中带有"技巧"标签的节点
+3. 所有关系类型统一为RELATED_TO，真实类型存储在keywords属性中
 
 ================================================================
 
@@ -756,13 +757,13 @@ JSON数组，每行包含查询结果记录
 
 查询某个实体的所有关系：
 {
-  "query": "MATCH (e:Entity {entity_id: $name})-[r]->(target:Entity) RETURN e.entity_id as source_entity, type(r) as relationship_type, r.description as description, r.weight as weight, target.entity_id as target_entity, target ORDER BY r.weight DESC",
+  "query": "MATCH (e {entity_id: $name})-[r:RELATED_TO]->(target) RETURN e.entity_id as source_entity, r.keywords as relationship_type, r.description as description, r.weight as weight, target.entity_id as target_entity, target ORDER BY r.weight DESC",
   "parameters": {"name": "线段树"},
   "vector_params": {"name": false},
   "limit": 20
 }
 
-关系查询：关系类型存储为Neo4j关系的type()，关键词存储在关系属性的keywords字段中
+
 
 ================================================================
 
@@ -770,7 +771,7 @@ JSON数组，每行包含查询结果记录
 
 查找所有和Gem Island相似的题目：
 {
-  "query": "MATCH (problem:Entity) WHERE '题目' IN labels(problem) AND problem.entity_id CONTAINS $problem_name MATCH (problem)-[r1]-(neighbor:Entity) MATCH (neighbor)-[r2]-(second_neighbor:Entity) WHERE '题目' IN labels(second_neighbor) RETURN second_neighbor.entity_id as entity_name, second_neighbor.description as description, [label IN labels(second_neighbor) WHERE NOT label = 'Entity'] as labels, second_neighbor.file_path as file_path, neighbor.entity_id as first_level_neighbor, r1.weight as r1_weight, r2.weight as r2_weight, (r1.weight + r2.weight) as total_weight ORDER BY total_weight DESC",
+  "query": "MATCH (problem) WHERE '题目' IN labels(problem) AND problem.entity_id CONTAINS $problem_name MATCH (problem)-[r1:RELATED_TO]-(neighbor) MATCH (neighbor)-[r2:RELATED_TO]-(second_neighbor) WHERE '题目' IN labels(second_neighbor) RETURN second_neighbor.entity_id as entity_name, second_neighbor.description as description, labels(second_neighbor) as labels, second_neighbor.file_path as file_path, neighbor.entity_id as first_level_neighbor, r1.weight as r1_weight, r2.weight as r2_weight, (r1.weight + r2.weight) as total_weight ORDER BY total_weight DESC",
   "parameters": {"problem_name": "Gem Island"},
   "vector_params": {"problem_name": false},
   "limit": 30
@@ -786,7 +787,7 @@ JSON数组，每行包含查询结果记录
 
 查询既可以用线段树也可以用树状数组解决的题目（使用向量搜索）：
 {
-  "query": "CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector1) YIELD node as e1 CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector2) YIELD node as e2 WITH collect(DISTINCT e1) as e1_list, collect(DISTINCT e2) as e2_list MATCH (e1_node)-[r1]-(common:Entity), (e2_node)-[r2]-(common) WHERE e1_node IN e1_list AND e2_node IN e2_list RETURN common.entity_id as entity_name, common.description as description, [label IN labels(common) WHERE NOT label = 'Entity'] as labels, (r1.weight + r2.weight) as total_weight ORDER BY total_weight DESC",
+  "query": "CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector1) YIELD node as e1 CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector2) YIELD node as e2 WITH collect(DISTINCT e1) as e1_list, collect(DISTINCT e2) as e2_list MATCH (e1_node)-[r1:RELATED_TO]-(common), (e2_node)-[r2:RELATED_TO]-(common) WHERE e1_node IN e1_list AND e2_node IN e2_list RETURN common.entity_id as entity_name, common.description as description, labels(common) as labels, (r1.weight + r2.weight) as total_weight ORDER BY total_weight DESC",
   "parameters": {"query_vector1": "线段树", "query_vector2": "树状数组"},
   "vector_params": {"query_vector1": true, "query_vector2": true},
   "limit": 20
@@ -803,11 +804,13 @@ JSON数组，每行包含查询结果记录
 
 已知两个实体的精确ID，查找它们1-2级邻域中共有的"题目"类型节点：
 {
-  "query": "MATCH path1=(e1:Entity {entity_id: $entity_id1})-[*1..2]-(common:Entity) MATCH path2=(e2:Entity {entity_id: $entity_id2})-[*1..2]-(common) WHERE '题目' IN labels(common) AND common <> e1 AND common <> e2 RETURN DISTINCT common.entity_id as entity_name, common.description as description, [label IN labels(common) WHERE NOT label = 'Entity'] as labels, common.file_path as file_path, length(path1) as dist_from_e1, length(path2) as dist_from_e2 ORDER BY (length(path1) + length(path2)) ASC",
+  "query": "MATCH path1=(e1 {entity_id: $entity_id1})-[*1..2:RELATED_TO]-(common) MATCH path2=(e2 {entity_id: $entity_id2})-[*1..2:RELATED_TO]-(common) WHERE '题目' IN labels(common) AND common <> e1 AND common <> e2 RETURN DISTINCT common.entity_id as entity_name, common.description as description, labels(common) as labels, common.file_path as file_path, length(path1) as dist_from_e1, length(path2) as dist_from_e2 ORDER BY (length(path1) + length(path2)) ASC",
   "parameters": {"entity_id1": "线段树<QyCKb7>", "entity_id2": "树状数组<ABC123>"},
   "vector_params": {"entity_id1": false, "entity_id2": false},
   "limit": 20
 }
+
+注意：使用[*1..2:RELATED_TO]指定关系类型，所有关系类型统一为RELATED_TO
 
 ================================================================
 
@@ -816,11 +819,11 @@ JSON数组，每行包含查询结果记录
 查询与"线段树维护区间"相关的题目：
 {
   "query": "CALL db.index.vector.queryNodes('entity_embedding_index', 25, $query_vector) YIELD node as concept_node
-  MATCH (concept_node)-[r1]-(mid:Entity)
-  MATCH (mid)-[r2]-(problem:Entity)
+  MATCH (concept_node)-[r1:RELATED_TO]-(mid)
+  MATCH (mid)-[r2:RELATED_TO]-(problem)
   WHERE '题目' IN labels(problem)
   RETURN problem.entity_id as entity_name, problem.description as description,
-         [label IN labels(problem) WHERE NOT label = 'Entity'] as labels,
+         labels(problem) as labels,
          problem.file_path as file_path,
          concept_node.entity_id as concept, mid.entity_id as intermediate,
          r1.weight as r1_weight, r2.weight as r2_weight,
@@ -833,6 +836,7 @@ JSON数组，每行包含查询结果记录
 
 适用场景：查找与某个概念相关的题目，通过中间节点（如技巧、实现）连接
 性能：~3-4秒 | 优势：发现通过间接关联的题目，效果显著提升
+注意：所有关系类型统一为RELATED_TO
 
 ================================================================
 
@@ -845,27 +849,27 @@ JSON数组，每行包含查询结果记录
   WITH collect(DISTINCT dp_node) as dp_nodes, collect(DISTINCT math_node) as math_nodes
 
   // 收集dp节点的一二级邻域
-  MATCH (dp)-[r1]-(dp_neighbor1)
+  MATCH (dp)-[r1:RELATED_TO]-(dp_neighbor1)
   WHERE dp IN dp_nodes
   WITH collect(DISTINCT dp_neighbor1) as dp_neighbors1, dp_nodes, math_nodes
-  MATCH (dp2)-[r2]-(dp_neighbor2)
+  MATCH (dp2)-[r2:RELATED_TO]-(dp_neighbor2)
   WHERE dp2 IN dp_nodes OR dp2 IN dp_neighbors1
   WITH collect(DISTINCT dp_neighbor2) as dp_all_neighbors, math_nodes
 
   // 收集组合数学节点的一二级邻域
-  MATCH (math)-[r3]-(math_neighbor1)
+  MATCH (math)-[r3:RELATED_TO]-(math_neighbor1)
   WHERE math IN math_nodes
   WITH collect(DISTINCT math_neighbor1) as math_neighbors1, dp_all_neighbors, math_nodes
-  MATCH (math2)-[r4]-(math_neighbor2)
+  MATCH (math2)-[r4:RELATED_TO]-(math_neighbor2)
   WHERE math2 IN math_nodes OR math2 IN math_neighbors1
   WITH collect(DISTINCT math_neighbor2) as math_all_neighbors, dp_all_neighbors
 
   // 取交集并过滤出题目标签
-  MATCH (candidate:Entity)
+  MATCH (candidate)
   WHERE candidate IN dp_all_neighbors AND candidate IN math_all_neighbors
     AND '题目' IN labels(candidate)
   RETURN candidate.entity_id as entity_name, candidate.description as description,
-         [label IN labels(candidate) WHERE NOT label = 'Entity'] as labels,
+         labels(candidate) as labels,
          candidate.file_path as file_path
   ORDER BY candidate.entity_id ASC",
   "parameters": {"query_vector1": "动态规划", "query_vector2": "组合数学"},
@@ -915,16 +919,16 @@ JSON数组，每行包含查询结果记录
 Neo4j 数据存储结构：
 
 实体存储：
-- 节点标签：'Entity'（通用标签）加上多个类型标签（如：'数据结构', '技巧'）
+- 节点标签：直接使用多个类型标签（如：'数据结构', '技巧', '题目'），不再有'Entity'通用标签
 - 节点属性：entity_id, description, file_path, created_at
-- 正确获取类型：排除'Entity'标签后，[label IN labels(node) WHERE NOT label = 'Entity'] 返回所有类型标签数组
+- 正确获取类型：直接使用labels(node)返回所有类型标签数组
 
 关系存储：
-- 关系类型：使用 type(r) 获取（如 "APPLIES_TO", "BASED_ON"）
-- 关系属性：description, weight, keywords（多个关键词用逗号分隔）
+- 关系类型：所有关系统一为RELATED_TO类型
+- 真实关系类型：存储在r.keywords属性中（多个关键词用逗号分隔，如"IS_A,BASED_ON"）
+- 关系属性：description, weight, keywords（真实关系类型列表）
 - 关系方向：支持 OUTGOING (->) 和 INCOMING (<-)
-
-重要：不要使用 labels()[0] 直接获取类型，因为第一个标签可能是 'Entity' 或其他标签！必须使用WHERE过滤。现在实体支持多标签，返回的是标签数组而不是单独的dim1/dim2字段。
+- 查询关系类型：使用 r.keywords CONTAINS 'IS_A' 而非 type(r) = 'IS_A'
 
 ================================================================
 
@@ -956,8 +960,6 @@ Neo4j 数据存储结构：
 【性能优化】
 1. 查询会自动添加 LIMIT 限制防止过载
 2. 对于复杂查询，可以使用分步查询避免超时
-3. 获取实体类型时必须排除'Entity'标签
-4. 优先使用缓存结果（chunks缓存机制）
 
 【按需使用策略】
 - 不要总是保守选择开销小的查询！根据查询需求选择合适的查询深度

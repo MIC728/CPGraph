@@ -136,12 +136,12 @@ class WorkerThread:
 
         semaphore = asyncio.Semaphore(self.config.max_concurrent_per_thread)
 
-        async def process_single_doc(doc: str) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+        async def process_single_doc(doc: str, doc_index: int) -> Tuple[List[Dict], List[Dict], List[Dict]]:
             async with semaphore:
-                return await self._async_process_single_doc(doc)
+                return await self._async_process_single_doc(doc, doc_index)
 
-        # 创建所有文档的处理任务
-        tasks = [process_single_doc(doc) for doc in doc_group]
+        # 创建所有文档的处理任务，为每个文档分配唯一索引
+        tasks = [process_single_doc(doc, i) for i, doc in enumerate(doc_group)]
 
         # 异步并发执行所有任务
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -163,11 +163,17 @@ class WorkerThread:
 
         return all_entities, all_relations, all_chunks
 
-    async def _async_process_single_doc(self, doc: str) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    async def _async_process_single_doc(self, doc: str, doc_index: int = 0) -> Tuple[List[Dict], List[Dict], List[Dict]]:
         """异步处理单个文档"""
         try:
+            # 为每个文档生成基于完整内容的file_path，确保唯一性
+            import hashlib
+            # 基于完整文档内容生成hash，保证唯一性
+            file_path_hash = hashlib.md5(doc.encode('utf-8')).hexdigest()[:16]
+            file_path = f"doc-{file_path_hash}"
+
             # 1. 文本分块
-            chunks = self._chunk_text(doc)
+            chunks = self._chunk_text(doc, file_path)
 
             # 2. LLM实体关系提取
             entities, relations = await self._extract_entities_with_llm(chunks)
@@ -178,7 +184,7 @@ class WorkerThread:
             logger.error(f"线程{self.thread_id}文档处理失败: {e}")
             return [], [], []
 
-    def _chunk_text(self, text: str) -> List[Dict[str, Any]]:
+    def _chunk_text(self, text: str, file_path: str = "extracted_document") -> List[Dict[str, Any]]:
         """文本分块 (复用 LightRAG 逻辑)"""
         # 检测并处理JSON格式输入（题目等数据）
         if text.strip().startswith(('{', '[')):
@@ -211,7 +217,7 @@ class WorkerThread:
                 "tokens": chunk_data["tokens"],
                 "chunk_order_index": i,
                 "full_doc_id": f"doc-{self.thread_id}",  # 临时ID
-                "file_path": f"unknown-{self.thread_id}",  # 临时路径
+                "file_path": file_path,  # 使用传入的文档路径
             })
 
         return chunks
@@ -439,9 +445,9 @@ class WorkerThread:
 
         return list(entity_map.values())
 
-    def _resolve_relations_global(self, relations: List[Dict], entities: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    def _resolve_relations_by_doc(self, relations: List[Dict], entities: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
         """
-        文档级别：将关系中的实体名称转换为实体引用
+        按文档分组解析关系：确保每个文档内的关系只引用该文档内的实体
         如果实体不存在，创建 UNKNOWN 类型的新实体
 
         Returns:
@@ -450,51 +456,70 @@ class WorkerThread:
         if not relations:
             return [], []
 
-        # 构建实体名称到实体的映射
-        name_to_entity = {e["entity_name"]: e for e in entities}
-        new_entities = []
+        # 按file_path分组处理，确保文档级实体管理
+        doc_groups = {}
+        for entity in entities:
+            file_path = entity.get("file_path", "unknown")
+            if file_path not in doc_groups:
+                doc_groups[file_path] = []
+            doc_groups[file_path].append(entity)
 
-        def get_or_create_entity(name: str, relation: Dict) -> Dict:
-            """获取或创建实体"""
-            if name in name_to_entity:
-                return name_to_entity[name]
+        all_resolved_relations = []
+        all_new_entities = []
 
-            # 创建 UNKNOWN 类型的新实体
-            new_entity = {
-                "entity_name": name,
-                "entity_type_dim1": "UNKNOWN",
-                "entity_type_dim2": "UNKNOWN",
-                "description": relation.get("description", ""),
-                "source_id": relation.get("source_chunk_id", ""),
-                "file_path": relation.get("file_path", "unknown"),
-                "data_source": "inferred"  # 标记为推断生成
-            }
-            name_to_entity[name] = new_entity
-            new_entities.append(new_entity)
-            logger.info(f"创建推断实体: {name}")
-            return new_entity
+        # 为每个文档组单独解析关系
+        for file_path, doc_entities in doc_groups.items():
+            # 构建当前文档的实体名称映射
+            name_to_entity = {e["entity_name"]: e for e in doc_entities}
+            doc_new_entities = []
 
-        resolved_relations = []
-        for relation in relations:
-            src_name = relation.get("src_name")
-            tgt_name = relation.get("tgt_name")
+            def get_or_create_entity(name: str, relation: Dict) -> Dict:
+                """获取或创建实体（仅在当前文档内）"""
+                if name in name_to_entity:
+                    return name_to_entity[name]
 
-            if not src_name or not tgt_name:
-                continue
+                # 创建 UNKNOWN 类型的新实体
+                new_entity = {
+                    "entity_name": name,
+                    "entity_type_dim1": "UNKNOWN",
+                    "entity_type_dim2": "UNKNOWN",
+                    "description": relation.get("description", ""),
+                    "source_id": relation.get("source_chunk_id", ""),
+                    "file_path": file_path,  # 使用当前文档的file_path
+                    "data_source": "inferred"  # 标记为推断生成
+                }
+                name_to_entity[name] = new_entity
+                doc_new_entities.append(new_entity)
+                logger.info(f"文档 '{file_path}' 创建推断实体: {name}")
+                return new_entity
 
-            # 获取或创建实体
-            src_entity = get_or_create_entity(src_name, relation)
-            tgt_entity = get_or_create_entity(tgt_name, relation)
+            # 解析当前文档的所有关系
+            for relation in relations:
+                # 只处理属于当前文档的关系
+                if relation.get("file_path") != file_path:
+                    continue
 
-            resolved_relation = relation.copy()
-            resolved_relation["src_entity"] = src_entity
-            resolved_relation["tgt_entity"] = tgt_entity
-            # 删除临时字段
-            resolved_relation.pop("src_name", None)
-            resolved_relation.pop("tgt_name", None)
-            resolved_relations.append(resolved_relation)
+                src_name = relation.get("src_name")
+                tgt_name = relation.get("tgt_name")
 
-        return resolved_relations, new_entities
+                if not src_name or not tgt_name:
+                    continue
+
+                # 获取或创建实体（仅在当前文档内）
+                src_entity = get_or_create_entity(src_name, relation)
+                tgt_entity = get_or_create_entity(tgt_name, relation)
+
+                resolved_relation = relation.copy()
+                resolved_relation["src_entity"] = src_entity
+                resolved_relation["tgt_entity"] = tgt_entity
+                # 删除临时字段
+                resolved_relation.pop("src_name", None)
+                resolved_relation.pop("tgt_name", None)
+                all_resolved_relations.append(resolved_relation)
+
+            all_new_entities.extend(doc_new_entities)
+
+        return all_resolved_relations, all_new_entities
 
     def _assign_random_ids(self, entities: List[Dict], relations: List[Dict]):
         """一次性为所有实体和关系分配随机ID"""
@@ -617,9 +642,9 @@ class FileExtractionController:
         # 5. 文档级别：合并同名实体
         all_entities = self._merge_entities_by_doc(all_entities)
 
-        # 6. 文档级别：解析关系（找不到的实体会被自动创建为 UNKNOWN 类型）
+        # 6. 文档级别：解析关系（确保每个文档内的关系只引用该文档内的实体）
         resolver = WorkerThread(0, self.llm_func, self.tokenizer, self.config)
-        all_relations, new_entities = resolver._resolve_relations_global(all_relations, all_entities)
+        all_relations, new_entities = resolver._resolve_relations_by_doc(all_relations, all_entities)
         all_entities.extend(new_entities)
 
         # 7. 文档级别：分配随机ID
