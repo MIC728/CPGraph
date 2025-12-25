@@ -1142,7 +1142,8 @@ def process_problem_entities_chunk(
                     all_dim2_types.update([t.strip() for t in dim2.replace('，', ',').split(',') if t.strip()])
 
             main_entity['entity_type_dim1'] = ','.join(sorted(all_dim1_types))
-            main_entity['entity_type_dim2'] = ','.join(sorted(all_dim2_types))
+            # 使用投票逻辑，取出现次数最多的前3个dim2标签
+            main_entity['entity_type_dim2'] = get_top_dim2_types(all_dim2_types, max_count=3)
 
             # 记录合并信息（merged_from是参与合并的所有实体的最原始ID）
             all_merged_from = []
@@ -1369,6 +1370,29 @@ def extract_problem_id(entity_id: str) -> str:
     if ' ' in entity_id:
         return entity_id.split(' ')[0]
     return ""
+
+
+def get_top_dim2_types(dim2_types: List[str], max_count: int = 3) -> str:
+    """
+    从dim2标签列表中投票选取得分最高的前N个标签
+
+    Args:
+        dim2_types: dim2标签列表（可能包含重复，来自多个实体的dim2标签）
+        max_count: 最大返回标签数，默认3
+
+    Returns:
+        逗号分隔的标签字符串
+    """
+    from collections import Counter
+
+    if not dim2_types:
+        return ""
+
+    # 统计每个标签出现次数
+    counter = Counter(dim2_types)
+    # 按次数降序排序，取前max_count个
+    top_types = [t for t, _ in counter.most_common(max_count)]
+    return ','.join(top_types)
 
 
 def embed_list_to_base64(embedding: list) -> str:
@@ -1726,10 +1750,11 @@ async def reclassify_unknown_entities(
 
         # 按逗号分隔dim2，检查每个类型是否在标准schema中
         dim2_types = [t.strip() for t in dim2.split(',') if t.strip()]
-        is_dim1_valid = dim1 in entity_types_dim1
-        is_dim2_valid = all(t in entity_types_dim2 for t in dim2_types)
+        is_dim1_valid = dim1 in entity_types_dim1 or dim1 == "其他"
+        # dim2中允许"其他"，但其他类型必须在schema中
+        is_dim2_valid = all((t in entity_types_dim2 or t == "其他") for t in dim2_types)
 
-        # 触发重分类的条件：UNKNOWN、空、或类型不在schema中
+        # 触发重分类的条件：UNKNOWN、空、或类型不在schema中（"其他"视为有效）
         if dim1 == "UNKNOWN" or dim2 == "UNKNOWN" or dim1 == "" or dim2 == "" or not is_dim1_valid or not is_dim2_valid:
             unknown_entities.append(entity)
         else:
@@ -1894,8 +1919,8 @@ def merge_entity_group(group: List[str], entities_dict: Dict[str, Dict[str, Any]
         main_entity['entity_type_dim1'] = dim1_counter.most_common(1)[0][0]
 
     if dim2_types:
-        dim2_counter = Counter(dim2_types)
-        main_entity['entity_type_dim2'] = dim2_counter.most_common(1)[0][0]
+        # 使用投票逻辑，取出现次数最多的前3个dim2标签
+        main_entity['entity_type_dim2'] = get_top_dim2_types(dim2_types, max_count=3)
 
     # 收集所有描述
     descriptions = []
@@ -2058,9 +2083,9 @@ async def merge_entity_group_async(group: List[str], entities_dict: Dict[str, Di
         main_entity['entity_type_dim1'] = dim1_counter.most_common(1)[0][0]
     
     if dim2_types:
-        dim2_counter = Counter(dim2_types)
-        main_entity['entity_type_dim2'] = dim2_counter.most_common(1)[0][0]
-    
+        # 使用投票逻辑，取出现次数最多的前3个dim2标签
+        main_entity['entity_type_dim2'] = get_top_dim2_types(dim2_types, max_count=3)
+
     # 收集所有描述
     descriptions = []
     for entity in group_entities:
@@ -2428,6 +2453,9 @@ async def process_entity_chunk_with_llm(
     entities_dict = {}
     deleted_entities = set()  # 记录被删除的实体
 
+    # 题目ID字典：题目ID -> 实体ID（用于题目实体精确匹配合并）
+    problem_id_map = {}
+
     for entity in entities:
         entity_id = entity.get('entity_id')
         entities_map[entity_id] = entity_id
@@ -2529,22 +2557,26 @@ async def process_entity_chunk_with_llm(
                 except Exception as e:
                     logger.warning(f"实体 {entity_id} HNSW查询失败: {e}")
 
-        # 题目实体特殊处理：题目ID完全匹配优先合并
+        # ==================== 题目实体特殊处理：题目ID精确匹配（使用dict） ====================
+        # 题目实体只通过题目ID精确匹配合并，不参与HNSW检索
         is_problem_type = "题目" in entity.get("entity_type_dim2", "")
-        if is_problem_type and similar_entities:
+        if is_problem_type:
             current_problem_id = extract_problem_id(entity_id)
             if current_problem_id:
-                same_problem_entities = [
-                    e for e in similar_entities
-                    if extract_problem_id(e.get("entity_id", "")) == current_problem_id
-                ]
-                if same_problem_entities:
-                    best_match_entity = same_problem_entities[0]
-                    best_match_entity_id = best_match_entity.get("entity_id")
-                    entities_map[entity_id] = best_match_entity_id
+                if current_problem_id in problem_id_map:
+                    # 同一道题（ID相同）→ 合并到已有实体
+                    matched_entity_id = problem_id_map[current_problem_id]
+                    entities_map[entity_id] = matched_entity_id
                     auto_merged_count += 1
-                    logger.debug(f"  ✓ 题目ID匹配合并: {entity_id} -> {best_match_entity_id} (题目ID: {current_problem_id})")
+                    logger.debug(f"  ✓ 题目ID匹配合并: {entity_id} -> {matched_entity_id} (题目ID: {current_problem_id})")
+                else:
+                    # 新题 → 添加到 problem_id_map
+                    problem_id_map[current_problem_id] = entity_id
+                    logger.debug(f"  ○ 新题目实体: {entity_id} (题目ID: {current_problem_id})")
+                # 题目实体不参与后续 HNSW 查询和普通实体处理
             continue
+
+        # ==================== HNSW查询相似实体（普通实体） ====================
 
         # 立即插入当前实体到HNSW（在查询之后，分流处理之前）
         if entity.get("embedding") is not None:
@@ -2552,11 +2584,11 @@ async def process_entity_chunk_with_llm(
             inserted_indices.append(idx)
             logger.debug(f"  实体 {entity_id} 已插入HNSW，索引位置: {idx}")
 
-        # ==================== 根据实体类型分流处理 ====================
+        # ==================== 根据实体来源分流处理 ====================
         is_problem_entity = entity.get("is_problem_extracted", False)
-        if is_problem_entity:
-
-            # 题目实体：直接使用相似度阈值判断
+        if is_problem_entity or True:
+            logger.info("0")
+            # 题目来源实体：直接使用相似度阈值判断
             if similar_entities and top1_similarity >= problem_similarity_threshold:
                 # 高相似度：直接合并
                 best_match_entity = similar_entities[0]
@@ -2569,7 +2601,7 @@ async def process_entity_chunk_with_llm(
                 auto_skipped_count += 1
                 logger.debug(f"  ○ 题目实体自动跳过: {entity_id} (相似度: {top1_similarity:.3f})")
         else:
-            # 普通实体：三级分流处理
+            # 普通来源实体：三级分流处理
             if similar_entities and top1_similarity >= high_similarity_threshold:
                 # 高相似度：直接合并
                 best_match_entity = similar_entities[0]
@@ -2792,7 +2824,8 @@ async def process_entity_chunk_with_llm(
 
             # 去重并合并类型
             main_entity['entity_type_dim1'] = ','.join(list(set(all_dim1_types)))
-            main_entity['entity_type_dim2'] = ','.join(list(set(all_dim2_types)))
+            # 使用投票逻辑，取出现次数最多的前3个dim2标签
+            main_entity['entity_type_dim2'] = get_top_dim2_types(all_dim2_types, max_count=3)
 
             # 拼接描述
             descriptions = [e.get('description', '') for e in group_entities if e.get('description')]
