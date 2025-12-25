@@ -2799,6 +2799,21 @@ async def process_entity_chunk_with_llm(
             if descriptions:
                 main_entity['description'] = GRAPH_FIELD_SEP.join(descriptions)
 
+            # 合并 source_id（chunk IDs）
+            source_ids = []
+            for entity in group_entities:
+                source_id = entity.get('source_id', '').strip()
+                if source_id:
+                    # 兼容多种分隔符
+                    if '<SEP>' in source_id:
+                        source_ids.extend([s.strip() for s in source_id.split('<SEP>') if s.strip()])
+                    else:
+                        source_ids.append(source_id)
+            if source_ids:
+                # 去重并保持顺序
+                unique_source_ids = list(dict.fromkeys(source_ids))
+                main_entity['source_id'] = GRAPH_FIELD_SEP.join(unique_source_ids)
+
             # 记录合并信息（merged_from是参与合并的所有实体的最原始ID）
             all_merged_from = []
             for entity in group_entities:
@@ -2846,6 +2861,21 @@ async def process_entity_chunk_with_llm(
                 main_entity["entity_type_dim1"] = merge_result["final_type_dim1"]
                 main_entity["entity_type_dim2"] = merge_result["final_type_dim2"]
                 main_entity["description"] = merge_result["final_description"]
+
+                # 合并 source_id（chunk IDs）- LLM合并后也需要保留所有源
+                source_ids = []
+                for entity in group_entities:
+                    source_id = entity.get('source_id', '').strip()
+                    if source_id:
+                        # 兼容多种分隔符
+                        if '<SEP>' in source_id:
+                            source_ids.extend([s.strip() for s in source_id.split('<SEP>') if s.strip()])
+                        else:
+                            source_ids.append(source_id)
+                if source_ids:
+                    # 去重并保持顺序
+                    unique_source_ids = list(dict.fromkeys(source_ids))
+                    main_entity['source_id'] = GRAPH_FIELD_SEP.join(unique_source_ids)
 
                 # 收集参与合并的所有实体的最原始ID
                 all_merged_from = []

@@ -832,9 +832,9 @@ JSON数组，每行包含查询结果记录
   MATCH (concept_node)-[r1:RELATED_TO]-(mid)
   MATCH (mid)-[r2:RELATED_TO]-(problem)
   WHERE '题目' IN labels(problem)
-  WITH problem, concept_node, mid, r1, r2,
+  WITH DISTINCT problem, concept_node, mid, r1, r2,
        (r1.weight * 0.4 + r2.weight * 0.6) as total_score
-  // 按 pagerank 和向量相似度综合排序
+  // 按 pagerank 和向量相似度综合排序（注意：DISTINCT 去重防止同一题目被多次返回）
   RETURN problem.entity_id as entity_name, problem.description as description,
          labels(problem) as labels,
          problem.file_path as file_path,
@@ -847,6 +847,8 @@ JSON数组，每行包含查询结果记录
   "limit": 30
 }
 ```
+
+⚠️ 重要：必须使用 `WITH DISTINCT` 去重！否则通过多个中间节点相连的同一题目会被返回多次。
 
 适用场景：查找与某个概念相关的题目，通过中间节点连接后按 pagerank 重排
 性能：~3-4秒 | 优势：按实体全局重要性排序，优先返回核心题目
@@ -863,7 +865,7 @@ JSON数组，每行包含查询结果记录
   CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector2) YIELD node as math_node
   WITH collect(DISTINCT dp_node) as dp_nodes, collect(DISTINCT math_node) as math_nodes
 
-  // 收集dp节点的一二级邻域
+  // 收集dp节点的一二级邻域（注意：每一步都使用 DISTINCT/collect(DISTINCT) 去重）
   MATCH (dp)-[r1:RELATED_TO]-(dp_neighbor1)
   WHERE dp IN dp_nodes
   WITH collect(DISTINCT dp_neighbor1) as dp_neighbors1, dp_nodes, math_nodes
@@ -879,10 +881,11 @@ JSON数组，每行包含查询结果记录
   WHERE math2 IN math_nodes OR math2 IN math_neighbors1
   WITH collect(DISTINCT math_neighbor2) as math_all_neighbors, dp_all_neighbors
 
-  // 取交集并过滤出题目标签
+  // 取交集并过滤出题目标签（使用 DISTINCT 确保交集中没有重复）
   MATCH (candidate)
   WHERE candidate IN dp_all_neighbors AND candidate IN math_all_neighbors
     AND '题目' IN labels(candidate)
+  WITH DISTINCT candidate
   RETURN candidate.entity_id as entity_name, candidate.description as description,
          labels(candidate) as labels,
          candidate.file_path as file_path,
@@ -893,6 +896,10 @@ JSON数组，每行包含查询结果记录
   "limit": 25
 }
 ```
+
+⚠️ 重要：多级邻域查询必须每一步都去重！
+- 使用 `collect(DISTINCT ...)` 收集唯一节点
+- 最终结果前加 `WITH DISTINCT candidate` 确保交集结果无重复
 
 适用场景：查找同时涉及多个领域的综合题目，发现跨领域关联后按 pagerank 重排
 性能：~5-6秒 | 优势：发现深层关联的题目，优先返回核心重要题目
