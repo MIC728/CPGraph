@@ -634,7 +634,7 @@ embedding 相关字段包括：embedding, vector, embedding_vector 等，请全�
 
 输入参数:
 - entity_query: string (必需) - 实体查询字符串，可以是实体名称或描述，例如："Splay"、"最短路算法"
-- top_k: integer (可选) - 返回的最相似实体数量，范围 1-20，超出范围将自动调整为安全值
+- top_k: integer (可选) - 返回的最相似实体数量，范围 1-30，超出范围将自动调整为安全值
 - rerank: string (可选) - 重排序策略：
 
   * "pass": 跳过重排，使用原始向量相似度排序（默认）
@@ -666,8 +666,8 @@ JSON数组，每个元素包含:
 1. 查找与"神经网络"相似的实体: {"entity_query": "神经网络", "top_k": 10}
 2. 查找"Python"相关的实体: {"entity_query": "Python编程语言"}
 3. 查找"数据库"相关实体: {"entity_query": "数据库管理系统"}
-4. 启用度数重排纠正偏差: {"entity_query": "LCT", "top_k": 10, "rerank": "degree"}
-5. 启用 PageRank 重排找重要实体: {"entity_query": "图算法", "top_k": 10, "rerank": "pagerank"}
+4. 启用度数重排纠正偏差: {"entity_query": "LCT", "top_k": 30, "rerank": "degree"}
+5. 启用 PageRank 重排找重要实体: {"entity_query": "图算法", "top_k": 20, "rerank": "pagerank"}
 
 重排策略选择建议:
 - 一般查询：使用 "pass" 或 "degree"
@@ -682,8 +682,8 @@ async def find_similar_entities(
 ) -> List[Dict[str, Any]]:
     """查找相似的实体"""
     # 安全控制：验证 top_k 参数，防止 DoS 攻击
-    SAFE_DEFAULT_TOP_K = 5
-    MAX_TOP_K = 20
+    SAFE_DEFAULT_TOP_K = 10
+    MAX_TOP_K = 30
 
     if top_k is None or top_k <= 0 or top_k > MAX_TOP_K:
         top_k = SAFE_DEFAULT_TOP_K if top_k is None or top_k <= 0 else MAX_TOP_K
@@ -823,35 +823,41 @@ JSON数组，每行包含查询结果记录
 
 ================================================================
 
-示例6: **向量搜索 + 二级关系**（推荐用于查找相关题目，~3-4秒）
+示例6: **向量搜索 + 二级关系 + pagerank 重排**（推荐用于查找相关题目，~3-4秒）
 
-查询与"线段树维护区间"相关的题目：
+查询与"线段树维护区间"相关的题目，并按 pagerank 重排：
+```json
 {
   "query": "CALL db.index.vector.queryNodes('entity_embedding_index', 25, $query_vector) YIELD node as concept_node
   MATCH (concept_node)-[r1:RELATED_TO]-(mid)
   MATCH (mid)-[r2:RELATED_TO]-(problem)
   WHERE '题目' IN labels(problem)
+  WITH problem, concept_node, mid, r1, r2,
+       (r1.weight * 0.4 + r2.weight * 0.6) as total_score
+  // 按 pagerank 和向量相似度综合排序
   RETURN problem.entity_id as entity_name, problem.description as description,
          labels(problem) as labels,
          problem.file_path as file_path,
+         problem.pagerank as pagerank,
          concept_node.entity_id as concept, mid.entity_id as intermediate,
-         r1.weight as r1_weight, r2.weight as r2_weight,
-         (r1.weight * 0.4 + r2.weight * 0.6) as total_score
-  ORDER BY total_score DESC",
+         r1.weight as r1_weight, r2.weight as r2_weight, total_score
+  ORDER BY problem.pagerank DESC, total_score DESC",
   "parameters": {"query_vector": "线段树维护区间"},
   "vector_params": {"query_vector": true},
   "limit": 30
 }
+```
 
-适用场景：查找与某个概念相关的题目，通过中间节点（如技巧、实现）连接
-性能：~3-4秒 | 优势：发现通过间接关联的题目，效果显著提升
-注意：所有关系类型统一为RELATED_TO
+适用场景：查找与某个概念相关的题目，通过中间节点连接后按 pagerank 重排
+性能：~3-4秒 | 优势：按实体全局重要性排序，优先返回核心题目
+注意：节点 pagerank 值反映其在整个知识图谱中的重要性，可作为排序依据
 
 ================================================================
 
-示例7: **多源向量搜索 + 邻域交集**（推荐用于查找综合题目，~5-6秒）
+示例7: **多源向量搜索 + 邻域交集 + pagerank 重排**（推荐用于查找综合题目，~5-6秒）
 
-检索同时和"动态规划，组合数学"有关的题目：
+检索同时和"动态规划，组合数学"有关的题目，并按 pagerank 重排：
+```json
 {
   "query": "CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector1) YIELD node as dp_node
   CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector2) YIELD node as math_node
@@ -879,15 +885,18 @@ JSON数组，每行包含查询结果记录
     AND '题目' IN labels(candidate)
   RETURN candidate.entity_id as entity_name, candidate.description as description,
          labels(candidate) as labels,
-         candidate.file_path as file_path
-  ORDER BY candidate.entity_id ASC",
+         candidate.file_path as file_path,
+         candidate.pagerank as pagerank
+  ORDER BY candidate.pagerank DESC, candidate.entity_id ASC",
   "parameters": {"query_vector1": "动态规划", "query_vector2": "组合数学"},
   "vector_params": {"query_vector1": true, "query_vector2": true},
   "limit": 25
 }
+```
 
-适用场景：查找同时涉及多个领域的综合题目，发现跨领域关联
-性能：~5-6秒 | 优势：发现深层关联的题目，提供跨领域视角
+适用场景：查找同时涉及多个领域的综合题目，发现跨领域关联后按 pagerank 重排
+性能：~5-6秒 | 优势：发现深层关联的题目，优先返回核心重要题目
+注意：返回结果包含 pagerank 字段，可用于后续分析
 
 ================================================================
 

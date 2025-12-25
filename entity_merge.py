@@ -3935,9 +3935,34 @@ def save_to_neo4j(
                 entity_id_to_node[record["entity_id"]] = record["node_id"]
         logger.info(f"节点映射: {len(entity_id_to_node)} 个节点")
 
-        # ==================== 预处理关系数据 ====================
-        logger.info("预处理关系数据...")
-        all_relation_data = []  # [{"src_id": ..., "tgt_id": ..., "rel_type": ..., "props": ...}]
+        # ==================== 预处理关系数据并按 dim1 分块 ====================
+        logger.info("预处理关系数据并按 dim1 分块...")
+
+        # 首先建立实体ID到dim1的映射
+        entity_id_to_dim1 = {}
+        for entity in merged_entities:
+            entity_id = entity.get("entity_id")
+            if entity_id:
+                dim1_str = entity.get("entity_type_dim1", "")
+                dim1_labels = [k.strip() for k in dim1_str.replace('，', ',').split(',') if k.strip()]
+                if dim1_labels:
+                    entity_id_to_dim1[entity_id] = dim1_labels[0]  # 使用第一个dim1类型
+                else:
+                    entity_id_to_dim1[entity_id] = "UNKNOWN"
+
+        # 同时处理merged_from中的ID
+        for entity in merged_entities:
+            entity_id = entity.get("entity_id")
+            merged_from = entity.get("merged_from", [])
+            dim1 = entity_id_to_dim1.get(entity_id, "UNKNOWN")
+            for old_id in merged_from:
+                if old_id not in entity_id_to_dim1:
+                    entity_id_to_dim1[old_id] = dim1
+
+        # 按dim1分块存储关系
+        relation_chunks = {}  # {dim1: [relations...]}
+        extra_relations = []  # 跨dim1的关系
+
         self_loops_removed = 0
         not_found_src = 0
         not_found_tgt = 0
@@ -3991,26 +4016,38 @@ def save_to_neo4j(
                 }
             }
 
-            all_relation_data.append(rel_data)
+            # 根据dim1分块
+            src_dim1 = entity_id_to_dim1.get(src_id, "UNKNOWN")
+            tgt_dim1 = entity_id_to_dim1.get(tgt_id, "UNKNOWN")
+
+            if src_dim1 == tgt_dim1:
+                # 同dim1，放入对应分块
+                if src_dim1 not in relation_chunks:
+                    relation_chunks[src_dim1] = []
+                relation_chunks[src_dim1].append(rel_data)
+            else:
+                # 跨dim1，放入extra
+                extra_relations.append(rel_data)
 
         stats["relations_self_loops_removed"] = self_loops_removed
 
-        logger.info(f"有效关系: {len(all_relation_data)}, 自环过滤: {self_loops_removed}, 端点不存在: {not_found_src + not_found_tgt}")
+        # 统计各分块数量
+        dim1_counts = {dim1: len(rels) for dim1, rels in relation_chunks.items()}
+        logger.info(f"关系分块统计: {dim1_counts}, extra: {len(extra_relations)}, 自环过滤: {self_loops_removed}, 端点不存在: {not_found_src + not_found_tgt}")
 
-        # ==================== 单线程批量插入关系（APOC UNWIND） ====================
-        logger.info("单线程批量插入关系（APOC UNWIND批量）...")
+        # ==================== 多线程按 dim1 分块插入关系 ====================
+        logger.info("多线程按 dim1 分块插入关系...")
 
-        def _insert_relations_batch() -> Tuple[int, int]:
-            """单线程批量插入所有关系（使用APOC UNWIND）"""
+        def _insert_relations_batch(relations: List[Dict], dim1_name: str = "default") -> Tuple[int, int]:
+            """批量插入一组关系（使用APOC UNWIND）"""
             success_count = 0
             fail_count = 0
+            local_count = len(relations)
 
-            if not all_relation_data:
-                logger.info("没有关系数据需要插入")
+            if not relations:
                 return 0, 0
 
             with driver.session() as session:
-                # 批量插入关系，使用 apoc.create.relationship
                 try:
                     query = """
                         UNWIND $rels AS r
@@ -4020,49 +4057,74 @@ def save_to_neo4j(
                         RETURN count(created) AS count
                     """
 
-                    # 分批处理以避免单次事务过大
-                    total = len(all_relation_data)
-                    processed = 0
-
-                    for i in range(0, total, relation_batch_size):
-                        batch = all_relation_data[i:i + relation_batch_size]
+                    for i in range(0, local_count, relation_batch_size):
+                        batch = relations[i:i + relation_batch_size]
                         batch_num = i // relation_batch_size + 1
-                        total_batches = (total + relation_batch_size - 1) // relation_batch_size
+                        total_batches = (local_count + relation_batch_size - 1) // relation_batch_size
 
                         result = session.run(query, rels=batch)
                         created = result.single()["count"]
                         success_count += created
-                        processed += len(batch)
 
-                        logger.info(f"  批次 {batch_num}/{total_batches}: 插入 {created}/{len(batch)} 个关系")
+                        logger.info(f"  [{dim1_name}] 批次 {batch_num}/{total_batches}: 插入 {created}/{len(batch)} 个关系")
 
                 except Exception as e:
-                    logger.error(f"APOC关系批量插入失败: {e}，回退到事务批量")
-                    # 回退：使用事务批量插入
-                    tx = session.begin_transaction()
-                    for rel in all_relation_data:
-                        try:
-                            tx.run(
-                                "MATCH (a:Entity {entity_id: $src_id}), (b:Entity {entity_id: $tgt_id}) "
-                                "CREATE (a)-[r:" + rel["rel_type"] + " {weight: $weight, description: $desc, keywords: $kw, source_id: $src, file_path: $fp, created_at: $ct}]->(b)",
-                                src_id=rel["src_id"],
-                                tgt_id=rel["tgt_id"],
-                                weight=rel["props"]["weight"],
-                                desc=rel["props"]["description"],
-                                kw=rel["props"]["keywords"],
-                                src=rel["props"]["source_id"],
-                                fp=rel["props"]["file_path"],
-                                ct=rel["props"]["created_at"]
-                            )
-                            success_count += 1
-                        except Exception as inner_e:
-                            fail_count += 1
-                    tx.commit()
-                    logger.info(f"  回退事务批量插入完成: 成功 {success_count}, 失败 {fail_count}")
+                    logger.error(f"  [{dim1_name}] APOC批量插入失败: {e}，回退到事务批量")
+                    try:
+                        tx = session.begin_transaction()
+                        for rel in relations:
+                            try:
+                                tx.run(
+                                    "MATCH (a:Entity {entity_id: $src_id}), (b:Entity {entity_id: $tgt_id}) "
+                                    "CREATE (a)-[r:" + rel["rel_type"] + " {weight: $weight, description: $desc, keywords: $kw, source_id: $src, file_path: $fp, created_at: $ct}]->(b)",
+                                    src_id=rel["src_id"],
+                                    tgt_id=rel["tgt_id"],
+                                    weight=rel["props"]["weight"],
+                                    desc=rel["props"]["description"],
+                                    kw=rel["props"]["keywords"],
+                                    src=rel["props"]["source_id"],
+                                    fp=rel["props"]["file_path"],
+                                    ct=rel["props"]["created_at"]
+                                )
+                                success_count += 1
+                            except Exception as inner_e:
+                                fail_count += 1
+                        tx.commit()
+                        logger.info(f"  [{dim1_name}] 回退插入完成: 成功 {success_count}, 失败 {fail_count}")
+                    except Exception as fallback_e:
+                        fail_count = local_count
+                        logger.error(f"  [{dim1_name}] 回退也失败: {fallback_e}")
 
             return success_count, fail_count
 
-        rel_success, rel_fail = _insert_relations_batch()
+        # 首先并行处理各dim1分块（每个分块一个线程）
+        dim1_chunks = [(dim1, rels) for dim1, rels in relation_chunks.items() if rels]
+        rel_success = 0
+        rel_fail = 0
+
+        if dim1_chunks:
+            logger.info(f"并行处理 {len(dim1_chunks)} 个 dim1 分块...")
+            with ThreadPoolExecutor(max_workers=len(dim1_chunks)) as executor:
+                futures = {
+                    executor.submit(_insert_relations_batch, rels, dim1): dim1
+                    for dim1, rels in dim1_chunks
+                }
+                for future in as_completed(futures):
+                    dim1 = futures[future]
+                    try:
+                        success, fail = future.result()
+                        rel_success += success
+                        rel_fail += fail
+                    except Exception as exc:
+                        logger.error(f"分块 [{dim1}] 执行失败: {exc}")
+                        rel_fail += len(relation_chunks.get(dim1, []))
+
+        # 最后单线程处理extra分块（跨dim1关系）
+        if extra_relations:
+            logger.info(f"单线程处理 extra 分块 ({len(extra_relations)} 个跨dim1关系)...")
+            extra_success, extra_fail = _insert_relations_batch(extra_relations, "extra")
+            rel_success += extra_success
+            rel_fail += extra_fail
         stats["relations_upserted"] = rel_success
         stats["relations_failed"] = rel_fail
 
@@ -4175,6 +4237,7 @@ async def create_neo4j_vector_indexes(
             # 计算PageRank
             if create_pagerank:
                 logger.info("计算全图PageRank...")
+                pagerank_success = False  # 标记PageRank是否成功
                 try:
                     # 检查GDS是否可用
                     result = await session.run("RETURN gds.version() AS version")
@@ -4182,14 +4245,33 @@ async def create_neo4j_vector_indexes(
                     gds_version = record['version']
                     logger.info(f"GDS版本: {gds_version}")
 
-                    # 删除已存在的图投影（如果存在）
+                    # 先检查图是否存在 (使用 gds.graph.list)
                     try:
-                        await session.run("CALL gds.graph.drop('entity_graph', false)")
-                        logger.info("已删除旧的图投影 'entity_graph'")
-                    except Exception:
-                        pass  # 图投影不存在，忽略
+                        result = await session.run("CALL gds.graph.list() YIELD graphName")
+                        existing_graphs = [record['graphName'] async for record in result]
+                        graph_exists = 'entity_graph' in existing_graphs
+                        logger.info(f"现有图投影: {existing_graphs}")
+                    except Exception as list_err:
+                        # 如果列表查询失败，假设图不存在，尝试直接删除
+                        graph_exists = False
+                        logger.warning(f"无法列出图投影: {list_err}")
+
+                    # 删除已存在的图投影（如果存在）
+                    if graph_exists:
+                        try:
+                            await session.run("CALL gds.graph.drop('entity_graph')")
+                            logger.info("已删除旧的图投影 'entity_graph'")
+                        except Exception as drop_err:
+                            drop_err_str = str(drop_err).lower()
+                            if "graphnotfoundexception" in drop_err_str or "does not exist" in drop_err_str:
+                                logger.info("图投影 'entity_graph' 不存在，无需删除")
+                            else:
+                                raise
+                    else:
+                        logger.info("图投影 'entity_graph' 不存在，无需删除")
 
                     # 创建图投影
+                    logger.info("创建图投影 'entity_graph'...")
                     await session.run("""
                         CALL gds.graph.project(
                             'entity_graph',
@@ -4202,8 +4284,10 @@ async def create_neo4j_vector_indexes(
                             }
                         )
                     """)
+                    logger.info("图投影创建成功")
 
                     # 运行PageRank算法
+                    logger.info("运行PageRank算法...")
                     result = await session.run("""
                         CALL gds.pageRank.write('entity_graph', {
                             writeProperty: 'pagerank',
@@ -4215,11 +4299,20 @@ async def create_neo4j_vector_indexes(
                     """)
                     record = await result.single()
                     pagerank_result = record['nodePropertiesWritten']
+                    pagerank_success = True  # PageRank写入成功
 
                     logger.info(f"PageRank计算完成，写入 {pagerank_result} 个节点")
 
-                    # 删除图投影
-                    await session.run("CALL gds.graph.drop('entity_graph')")
+                    # 删除图投影（使用IF EXISTS语法）
+                    try:
+                        await session.run("CALL gds.graph.drop('entity_graph') YIELD graphName")
+                        logger.info("已删除图投影 'entity_graph'")
+                    except Exception as drop_err:
+                        drop_err_str = str(drop_err).lower()
+                        if "graphnotfoundexception" in drop_err_str or "does not exist" in drop_err_str:
+                            logger.info("图投影 'entity_graph' 已被自动清理或不存在")
+                        else:
+                            logger.warning(f"删除图投影时出现警告: {drop_err}")
 
                     # 创建PageRank索引
                     await session.run("""
@@ -4233,6 +4326,12 @@ async def create_neo4j_vector_indexes(
                     if "gds.version" in str(e) or "ProcedureNotFound" in str(e):
                         logger.warning("GDS插件未安装，跳过PageRank计算")
                         logger.info("如需PageRank功能，请安装GDS插件：https://neo4j.com/docs/graph-data-science/")
+                    elif "graphnotfoundexception" in str(e).lower() or "does not exist" in str(e).lower():
+                        if pagerank_success:
+                            # PageRank已经成功写入，忽略图不存在的错误
+                            logger.info("PageRank已成功写入，图投影可能已被自动清理")
+                        else:
+                            logger.warning(f"图投影不存在或已失效: {e}")
                     else:
                         logger.warning(f"PageRank计算失败: {e}")
 
