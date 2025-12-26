@@ -1068,9 +1068,21 @@ def process_problem_entities_chunk(
     # 题目实体策略：只检索1个最相似实体，相似度>阈值才合并
     auto_merged_count = 0
     auto_skipped_count = 0
+    invalid_id_count = 0  # 无效题目ID计数
 
     for idx, entity in enumerate(entities_with_embeddings):
         entity_id = entity.get("entity_id")
+
+        # 校验题目ID格式：无效ID的实体不参与合并，直接保留
+        problem_id = extract_problem_id(entity_id)
+        if problem_id is None:
+            # 无效ID：跳过相似度比较，保持 entities_map[entity_id] = entity_id（独立保留）
+            invalid_id_count += 1
+            logger.debug(f"  ○ 跳过无效ID实体: {entity_id} (ID格式无效)")
+            # 仍然插入HNSW索引，保持索引完整性
+            if entity.get("embedding") is not None:
+                index.add_items(entity["embedding"], idx)
+            continue
 
         # 查询最相似实体（只查询已插入的节点）
         if entity.get("embedding") is not None:
@@ -1365,11 +1377,44 @@ def extract_entity_name(entity_id: str) -> str:
     return entity_id
 
 
-def extract_problem_id(entity_id: str) -> str:
-    """从实体ID中提取题目ID（前缀部分，空格分隔）"""
+def is_valid_problem_id(problem_id: str) -> bool:
+    """
+    校验题目ID是否有效
+
+    有效题目ID必须同时包含至少一个字母和至少一个数字。
+    例如: "Codeforces 123" -> 有效, "Codeforces" -> 无效
+
+    Args:
+        problem_id: 待校验的题目ID
+
+    Returns:
+        bool: 是否为有效的题目ID
+    """
+    if not problem_id:
+        return False
+    import re
+    # 必须同时包含字母和数字
+    has_letter = bool(re.search(r'[a-zA-Z]', problem_id))
+    has_digit = bool(re.search(r'\d', problem_id))
+    return has_letter and has_digit
+
+
+def extract_problem_id(entity_id: str) -> str | None:
+    """
+    从实体ID中提取题目ID（前缀部分，空格分隔）
+
+    Args:
+        entity_id: 实体ID
+
+    Returns:
+        str | None: 提取的题目ID，如果格式无效则返回None
+    """
     if ' ' in entity_id:
-        return entity_id.split(' ')[0]
-    return ""
+        extracted = entity_id.split(' ')[0]
+        # 校验提取出的ID是否有效
+        if is_valid_problem_id(extracted):
+            return extracted
+    return None
 
 
 def get_top_dim2_types(dim2_types: List[str], max_count: int = 3) -> str:
@@ -2586,8 +2631,7 @@ async def process_entity_chunk_with_llm(
 
         # ==================== 根据实体来源分流处理 ====================
         is_problem_entity = entity.get("is_problem_extracted", False)
-        if is_problem_entity or True:
-            logger.info("0")
+        if is_problem_entity:
             # 题目来源实体：直接使用相似度阈值判断
             if similar_entities and top1_similarity >= problem_similarity_threshold:
                 # 高相似度：直接合并
