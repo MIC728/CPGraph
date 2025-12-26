@@ -1399,6 +1399,50 @@ def is_valid_problem_id(problem_id: str) -> bool:
     return has_letter and has_digit
 
 
+def detect_platform(problem_id: str) -> str:
+    """
+    根据题目ID格式检测所属题库/平台
+
+    Args:
+        problem_id: 有效的题目ID
+
+    Returns:
+        str: 题库标签，如 "Luogu", "Codeforces", "未知题库" 等
+    """
+    import re
+
+    # Luogu: P+至少一个数字 (如 P1001, P12345)
+    if re.match(r'^P\d+$', problem_id, re.IGNORECASE):
+        return "Luogu"
+
+    # Codeforces: CF+数字+可选单个字母 (如 CF123D, CF1000)
+    if re.match(r'^CF\d+[A-Z]?$', problem_id, re.IGNORECASE):
+        return "Codeforces"
+
+
+    # 默认返回 "未知题库"
+    return "未知题库"
+
+
+def extract_problem_id_with_platform(entity_id: str) -> Tuple[str | None, str | None]:
+    """
+    从实体ID中提取题目ID和题库标签（前缀部分，空格分隔）
+
+    Args:
+        entity_id: 实体ID
+
+    Returns:
+        Tuple[str | None, str | None]: (题目ID, 题库标签)，如果格式无效则返回 (None, None)
+    """
+    if ' ' in entity_id:
+        extracted = entity_id.split(' ')[0]
+        # 校验提取出的ID是否有效
+        if is_valid_problem_id(extracted):
+            platform = detect_platform(extracted)
+            return extracted, platform
+    return None, None
+
+
 def extract_problem_id(entity_id: str) -> str | None:
     """
     从实体ID中提取题目ID（前缀部分，空格分隔）
@@ -2606,8 +2650,19 @@ async def process_entity_chunk_with_llm(
         # 题目实体只通过题目ID精确匹配合并，不参与HNSW检索
         is_problem_type = "题目" in entity.get("entity_type_dim2", "")
         if is_problem_type:
-            current_problem_id = extract_problem_id(entity_id)
+            current_problem_id, platform_label = extract_problem_id_with_platform(entity_id)
             if current_problem_id:
+                # 添加题库标签到 entity_type_dim2
+                if platform_label and platform_label != "未知题库":
+                    current_dim2 = entity.get("entity_type_dim2", "")
+                    if current_dim2:
+                        # 避免重复添加
+                        if platform_label not in current_dim2:
+                            entity["entity_type_dim2"] = f"{current_dim2},{platform_label}"
+                    else:
+                        entity["entity_type_dim2"] = platform_label
+                    logger.debug(f"  + 题库标签: {entity_id} -> {platform_label}")
+
                 if current_problem_id in problem_id_map:
                     # 同一道题（ID相同）→ 合并到已有实体
                     matched_entity_id = problem_id_map[current_problem_id]
