@@ -627,10 +627,8 @@ service = KGQueryService()
 @mcp.tool(
     name="find_similar_entities",
     description="""相似实体检索工具 - 基于向量相似度搜索知识图谱中的相似实体
-
-【重要提示】：请不要在返回结果中包含 embedding 向量或任何向量数据字段！
-只返回文本属性：entity_name, description, labels, file_path, created_at 等。
-embedding 相关字段包括：embedding, vector, embedding_vector 等，请全部排除！
+    
+重要：每次查询只查询一个独立概念！不要把多个无关概念拼接在一起查询
 
 输入参数:
 - entity_query: string (必需) - 实体查询字符串，可以是实体名称或描述，例如："Splay"、"最短路算法"
@@ -719,6 +717,15 @@ async def find_similar_entities(
 返回格式:
 JSON数组，每行包含查询结果记录
 
+【快速参考】：查询模式示例
+| 模式 | 用途 | 关键特征 |
+|------|------|----------|
+| **示例1**：冷门技巧挖掘 | 查找知识点的冷门技巧 | 使用向量搜索，pagerank倒序 |
+| **示例2**：实体关系探索 | 查看实体的所有关联 | 精确ID匹配，关系权重排序 |
+| **示例3**：相似题目发现 | 找到相似题目 | 二级邻域搜索，题目标签过滤 |
+| **示例4**：共同邻居查询 | 找两个概念都关联的节点 | 向量搜索+关系交集 |
+| **示例5**：精确共同题目 | 已知ID找共同题目 | 精确ID，1-2跳邻域 |
+
 ================================================================
 
 示例1: 查询与Splay树相关的冷门技巧（pagerank倒序排列）：
@@ -767,7 +774,7 @@ JSON数组，每行包含查询结果记录
 
 ================================================================
 
-示例4: 复杂查询 - 找到同时与两个实体相邻的节点
+示例4: 找到同时与两个实体相邻的节点
 
 查询既可以用线段树也可以用树状数组解决的题目（使用向量搜索）：
 {
@@ -784,68 +791,17 @@ JSON数组，每行包含查询结果记录
 
 ================================================================
 
-示例5: 精确ID的邻域共同题目查询
+示例5: 精确ID的二级邻域共同题目查询（推荐使用）
 
 已知两个实体的精确ID，查找它们1-2级邻域中共有的"题目"类型节点：
 {
-  "query": "MATCH path1=(e1 {entity_id: $entity_id1})-[*1..2:RELATED_TO]-(common) MATCH path2=(e2 {entity_id: $entity_id2})-[*1..2:RELATED_TO]-(common) WHERE '题目' IN labels(common) AND common <> e1 AND common <> e2 RETURN DISTINCT common.entity_id as entity_name, common.description as description, labels(common) as labels, common.file_path as file_path, length(path1) as dist_from_e1, length(path2) as dist_from_e2 ORDER BY (length(path1) + length(path2)) ASC",
+  "query": "MATCH path1=(e1 {entity_id: $entity_id1})-[*1..2]-(common) MATCH path2=(e2 {entity_id: $entity_id2})-[*1..2]-(common) WHERE '题目' IN labels(common) AND common <> e1 AND common <> e2 RETURN DISTINCT common.entity_id as entity_name, common.description as description, labels(common) as labels, common.file_path as file_path, length(path1) as dist_from_e1, length(path2) as dist_from_e2 ORDER BY (length(path1) + length(path2)) ASC",
   "parameters": {"entity_id1": "线段树<QyCKb7>", "entity_id2": "树状数组<ABC123>"},
   "vector_params": {"entity_id1": false, "entity_id2": false},
   "limit": 20
 }
 
 注意：使用[*1..2:RELATED_TO]指定关系类型，所有关系类型统一为RELATED_TO
-
-================================================================
-
-示例6: **多源向量搜索 + 邻域交集 + pagerank 重排**（推荐用于查找综合题目，~5-6秒）
-
-检索同时和"动态规划，组合数学"有关的题目，并按 pagerank 重排：
-```json
-{
-  "query": "CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector1) YIELD node as dp_node
-  CALL db.index.vector.queryNodes('entity_embedding_index', 20, $query_vector2) YIELD node as math_node
-  WITH collect(DISTINCT dp_node) as dp_nodes, collect(DISTINCT math_node) as math_nodes
-
-  // 收集dp节点的一二级邻域（注意：每一步都使用 DISTINCT/collect(DISTINCT) 去重）
-  MATCH (dp)-[r1:RELATED_TO]-(dp_neighbor1)
-  WHERE dp IN dp_nodes
-  WITH collect(DISTINCT dp_neighbor1) as dp_neighbors1, dp_nodes, math_nodes
-  MATCH (dp2)-[r2:RELATED_TO]-(dp_neighbor2)
-  WHERE dp2 IN dp_nodes OR dp2 IN dp_neighbors1
-  WITH collect(DISTINCT dp_neighbor2) as dp_all_neighbors, math_nodes
-
-  // 收集组合数学节点的一二级邻域
-  MATCH (math)-[r3:RELATED_TO]-(math_neighbor1)
-  WHERE math IN math_nodes
-  WITH collect(DISTINCT math_neighbor1) as math_neighbors1, dp_all_neighbors, math_nodes
-  MATCH (math2)-[r4:RELATED_TO]-(math_neighbor2)
-  WHERE math2 IN math_nodes OR math2 IN math_neighbors1
-  WITH collect(DISTINCT math_neighbor2) as math_all_neighbors, dp_all_neighbors
-
-  // 取交集并过滤出题目标签（使用 DISTINCT 确保交集中没有重复）
-  MATCH (candidate)
-  WHERE candidate IN dp_all_neighbors AND candidate IN math_all_neighbors
-    AND '题目' IN labels(candidate)
-  WITH DISTINCT candidate
-  RETURN candidate.entity_id as entity_name, candidate.description as description,
-         labels(candidate) as labels,
-         candidate.file_path as file_path,
-         candidate.pagerank as pagerank
-  ORDER BY candidate.pagerank DESC, candidate.entity_id ASC",
-  "parameters": {"query_vector1": "动态规划", "query_vector2": "组合数学"},
-  "vector_params": {"query_vector1": true, "query_vector2": true},
-  "limit": 25
-}
-```
-
-⚠️ 重要：多级邻域查询必须每一步都去重！
-- 使用 `collect(DISTINCT ...)` 收集唯一节点
-- 最终结果前加 `WITH DISTINCT candidate` 确保交集结果无重复
-
-适用场景：查找同时涉及多个领域的综合题目，发现跨领域关联后按 pagerank 重排
-性能：~5-6秒 | 优势：发现深层关联的题目，优先返回核心重要题目
-注意：返回结果包含 pagerank 字段，可用于后续分析
 
 ================================================================
 
@@ -909,7 +865,7 @@ Neo4j 数据存储结构：
 【工作流程建议】
 1. 探索阶段：使用 find_similar_entities 快速找到相关实体
 2. 精确查询：使用 execute_custom_cypher 进行深度挖掘
-3. 可以先使用 find_similar_entities 工具找到一个确定节点的ID，再使用Cypher工具精确匹配节点ID
+3. 可以先使用 find_similar_entities 工具找到一个确定节点的ID，再使用Cypher工具精确匹配节点ID，从一二级邻域中挖掘信息
 4. 多步查询：先使用简单查询确认方向，再使用复杂查询深入挖掘
 
 【性能优化】
@@ -1035,20 +991,27 @@ if __name__ == "__main__":
     async def init_service():
         # 初始化 Neo4j 服务
         await service.initialize(embedding_func=embedding_func)
-        # # 初始化 LightRAG 管理器（用于获取 chunk 内容）
-        # await lightrag_manager.initialize()
+        logger.info("[OK] Service initialized successfully, ready to accept requests")
 
-    asyncio.run(init_service())
-    import asyncio
+    try:
+        asyncio.run(init_service())
+    except Exception as e:
+        logger.error(f"[FATAL] Service initialization failed: {e}")
+        logger.error("[FATAL] Cannot start MCP server without database connection")
+        exit(1)
+
     # 从环境变量读取MCP配置
     mcp_host = os.getenv("MCP_HOST", "127.0.0.1")
     mcp_port = int(os.getenv("MCP_PORT", "8000"))
     # 从环境变量读取日志等级（默认 INFO），并转换为小写
     mcp_log_level = os.getenv("LOG_LEVEL", "INFO").lower()
-    asyncio.run(mcp.run_async(
-            transport="streamable-http",
-            host=mcp_host,
-            port=mcp_port,
-            log_level=mcp_log_level,
-            stateless_http=True
-        ))
+    logger.info(f"[INFO] Starting MCP server on {mcp_host}:{mcp_port}")
+
+    # 运行 MCP 服务器
+    mcp.run(
+        transport="streamable-http",
+        host=mcp_host,
+        port=mcp_port,
+        log_level=mcp_log_level,
+        stateless_http=True
+    )

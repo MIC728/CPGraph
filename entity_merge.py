@@ -1154,8 +1154,8 @@ def process_problem_entities_chunk(
                     all_dim2_types.update([t.strip() for t in dim2.replace('，', ',').split(',') if t.strip()])
 
             main_entity['entity_type_dim1'] = ','.join(sorted(all_dim1_types))
-            # 使用投票逻辑，取出现次数最多的前3个dim2标签
-            main_entity['entity_type_dim2'] = get_top_dim2_types(all_dim2_types, max_count=3)
+            # 使用新规则计算dim2：top1无条件加入，top2/top3需要>=70%阈值
+            main_entity['entity_type_dim2'] = get_top_dim2_types_with_threshold(list(all_dim2_types), len(group), max_count=3)
 
             # 记录合并信息（merged_from是参与合并的所有实体的最原始ID）
             all_merged_from = []
@@ -1484,6 +1484,56 @@ def get_top_dim2_types(dim2_types: List[str], max_count: int = 3) -> str:
     return ','.join(top_types)
 
 
+def get_top_dim2_types_with_threshold(dim2_types: List[str], group_size: int, max_count: int = 3) -> str:
+    """
+    从dim2标签列表中按新规则选取得分最高的前N个标签
+
+    合并规则：
+    - top1: 一定加入（票数 >= 1）
+    - top2/top3: 票数 >= ceil(70% * group_size)
+    - top4+: 不考虑
+
+    Args:
+        dim2_types: dim2标签列表（可能包含重复，来自多个实体的dim2标签）
+        group_size: 合并组的实体数量
+        max_count: 最大返回标签数，默认3
+
+    Returns:
+        逗号分隔的标签字符串
+    """
+    import math
+    from collections import Counter
+
+    if not dim2_types:
+        return ""
+
+    # 统计每个标签出现次数
+    counter = Counter(dim2_types)
+
+    # 计算阈值：70% * group_size，向上取整
+    threshold = math.ceil(0.7 * group_size)
+
+    # 按票数降序排序
+    sorted_types = counter.most_common()
+
+    # 选择符合条件的类型
+    selected = []
+    for type_name, count in sorted_types:
+        if len(selected) >= max_count:
+            break
+        # top1无条件加入，top2/top3需要满足阈值
+        if len(selected) == 0:
+            # top1
+            selected.append(type_name)
+        elif len(selected) <= 2 and count >= threshold:
+            # top2, top3
+            selected.append(type_name)
+        else:
+            break
+
+    return ','.join(selected)
+
+
 def embed_list_to_base64(embedding: list) -> str:
     """将embedding列表转为base64字符串，减少存储空间"""
     import numpy as np
@@ -1673,9 +1723,7 @@ async def call_entity_evaluation_llm(
 
 async def call_entity_group_merge_llm(
     entities: List[Dict[str, Any]],
-    llm_func: Callable,
-    entity_types_dim1: List[str] = None,
-    entity_types_dim2: List[str] = None
+    llm_func: Callable
 ) -> Dict[str, Any]:
     """
     调用LLM合并实体组
@@ -1683,20 +1731,13 @@ async def call_entity_group_merge_llm(
     Args:
         entities: 待合并的实体列表
         llm_func: LLM调用函数
-        entity_types_dim1: 第一维度类型列表
-        entity_types_dim2: 第二维度类型列表
 
     Returns:
         {
             "final_name": str,
-            "final_type_dim1": str,
-            "final_type_dim2": str,
             "final_description": str
         }
     """
-    entity_types_dim1 = entity_types_dim1 or DEFAULT_ENTITY_TYPES_DIM1
-    entity_types_dim2 = entity_types_dim2 or DEFAULT_ENTITY_TYPES_DIM2
-
     # 构建输入JSON - 保留完整ID（带随机ID）
     entities_json = json.dumps([
         {
@@ -1709,16 +1750,12 @@ async def call_entity_group_merge_llm(
     ], ensure_ascii=False, indent=2)
 
     prompt = PROMPTS["entity_group_merge"].format(
-        entity_types_dim1=", ".join(entity_types_dim1),
-        entity_types_dim2=", ".join(entity_types_dim2),
         entities_list=entities_json
     )
 
     # 默认结果：使用第一个实体的信息，描述用SEP拼接
     default_result = {
         "final_name": entities[0].get("entity_id", ""),
-        "final_type_dim1": entities[0].get("entity_type_dim1", "其他"),
-        "final_type_dim2": entities[0].get("entity_type_dim2", "概念"),
         "final_description": "<SEP>".join(e.get("description", "") for e in entities if e.get("description"))
     }
 
@@ -1999,17 +2036,23 @@ def merge_entity_group(group: List[str], entities_dict: Dict[str, Dict[str, Any]
     logger.info(f"开始合并 {len(group_entities)} 个实体，主实体: {primary_entity_id}")
 
     # 合并实体类型
-    dim1_types = [e.get('entity_type_dim1', '') for e in group_entities if e.get('entity_type_dim1')]
-    dim2_types = [e.get('entity_type_dim2', '') for e in group_entities if e.get('entity_type_dim2')]
+    all_dim1_types = []
+    all_dim2_types = []
+    for entity in group_entities:
+        dim1 = entity.get('entity_type_dim1', '')
+        dim2 = entity.get('entity_type_dim2', '')
+        if dim1:
+            all_dim1_types.extend([t.strip() for t in dim1.replace('，', ',').split(',') if t.strip()])
+        if dim2:
+            all_dim2_types.extend([t.strip() for t in dim2.replace('，', ',').split(',') if t.strip()])
 
-    # 选择最常见的类型作为主要类型
-    if dim1_types:
-        dim1_counter = Counter(dim1_types)
-        main_entity['entity_type_dim1'] = dim1_counter.most_common(1)[0][0]
+    # dim1：求并集
+    if all_dim1_types:
+        main_entity['entity_type_dim1'] = ','.join(list(set(all_dim1_types)))
 
-    if dim2_types:
-        # 使用投票逻辑，取出现次数最多的前3个dim2标签
-        main_entity['entity_type_dim2'] = get_top_dim2_types(dim2_types, max_count=3)
+    # dim2：使用新规则计算
+    if all_dim2_types:
+        main_entity['entity_type_dim2'] = get_top_dim2_types_with_threshold(all_dim2_types, len(group), max_count=3)
 
     # 收集所有描述
     descriptions = []
@@ -2161,19 +2204,25 @@ async def merge_entity_group_async(group: List[str], entities_dict: Dict[str, Di
     primary_entity_id = group_entities[0].get('entity_id', '')
     
     logger.info(f"开始合并 {len(group_entities)} 个实体，主实体: {primary_entity_id}")
-    
+
     # 合并实体类型
-    dim1_types = [e.get('entity_type_dim1', '') for e in group_entities if e.get('entity_type_dim1')]
-    dim2_types = [e.get('entity_type_dim2', '') for e in group_entities if e.get('entity_type_dim2')]
-    
-    # 选择最常见的类型作为主要类型
-    if dim1_types:
-        dim1_counter = Counter(dim1_types)
-        main_entity['entity_type_dim1'] = dim1_counter.most_common(1)[0][0]
-    
-    if dim2_types:
-        # 使用投票逻辑，取出现次数最多的前3个dim2标签
-        main_entity['entity_type_dim2'] = get_top_dim2_types(dim2_types, max_count=3)
+    all_dim1_types = []
+    all_dim2_types = []
+    for entity in group_entities:
+        dim1 = entity.get('entity_type_dim1', '')
+        dim2 = entity.get('entity_type_dim2', '')
+        if dim1:
+            all_dim1_types.extend([t.strip() for t in dim1.replace('，', ',').split(',') if t.strip()])
+        if dim2:
+            all_dim2_types.extend([t.strip() for t in dim2.replace('，', ',').split(',') if t.strip()])
+
+    # dim1：求并集
+    if all_dim1_types:
+        main_entity['entity_type_dim1'] = ','.join(list(set(all_dim1_types)))
+
+    # dim2：使用新规则计算
+    if all_dim2_types:
+        main_entity['entity_type_dim2'] = get_top_dim2_types_with_threshold(all_dim2_types, len(group), max_count=3)
 
     # 收集所有描述
     descriptions = []
@@ -2923,8 +2972,8 @@ async def process_entity_chunk_with_llm(
 
             # 去重并合并类型
             main_entity['entity_type_dim1'] = ','.join(list(set(all_dim1_types)))
-            # 使用投票逻辑，取出现次数最多的前3个dim2标签
-            main_entity['entity_type_dim2'] = get_top_dim2_types(all_dim2_types, max_count=3)
+            # 使用新规则计算dim2：top1无条件加入，top2/top3需要>=70%阈值
+            main_entity['entity_type_dim2'] = get_top_dim2_types_with_threshold(all_dim2_types, len(group), max_count=3)
 
             # 拼接描述
             descriptions = [e.get('description', '') for e in group_entities if e.get('description')]
@@ -2982,17 +3031,29 @@ async def process_entity_chunk_with_llm(
                 """异步合并单个实体组"""
                 merge_result = await call_entity_group_merge_llm(
                     entities=group_entities,
-                    llm_func=llm_func,
-                    entity_types_dim1=entity_types_dim1,
-                    entity_types_dim2=entity_types_dim2
+                    llm_func=llm_func
                 )
 
                 # 构建合并后的实体
                 main_entity = group_entities[0].copy()
                 main_entity["entity_id"] = merge_result["final_name"]
-                main_entity["entity_type_dim1"] = merge_result["final_type_dim1"]
-                main_entity["entity_type_dim2"] = merge_result["final_type_dim2"]
                 main_entity["description"] = merge_result["final_description"]
+
+                # 合并实体类型（dim1求并集，dim2使用新规则）
+                all_dim1_types = []
+                all_dim2_types = []
+                for entity in group_entities:
+                    dim1 = entity.get('entity_type_dim1', '')
+                    dim2 = entity.get('entity_type_dim2', '')
+                    if dim1:
+                        all_dim1_types.extend([t.strip() for t in dim1.replace('，', ',').split(',') if t.strip()])
+                    if dim2:
+                        all_dim2_types.extend([t.strip() for t in dim2.replace('，', ',').split(',') if t.strip()])
+
+                # dim1：求并集
+                main_entity['entity_type_dim1'] = ','.join(list(set(all_dim1_types)))
+                # dim2：使用新规则计算
+                main_entity['entity_type_dim2'] = get_top_dim2_types_with_threshold(all_dim2_types, len(group), max_count=3)
 
                 # 合并 source_id（chunk IDs）- LLM合并后也需要保留所有源
                 source_ids = []
