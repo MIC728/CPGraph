@@ -263,7 +263,7 @@ class KGQueryService:
             await self.initialize()
 
         # 计算实际向量检索的top_k
-        vector_top_k = top_k * 4 if rerank == "degree" else top_k
+        vector_top_k = top_k * 4 if rerank != "pass" else top_k
         logger.info(f"[INFO] Finding similar entities: '{entity_query}' (top_k={top_k}, rerank={rerank}, vector_top_k={vector_top_k})")
 
         try:
@@ -625,63 +625,67 @@ service = KGQueryService()
 
 
 @mcp.tool(
-    name="find_similar_entities",
-    description="""相似实体检索工具 - 基于向量相似度搜索知识图谱中的相似实体
-    
-重要：每次查询只查询一个独立概念！不要把多个无关概念拼接在一起查询
+    name="find_entity_by_name",
+    description="""实体定位工具 - 根据文本描述定位知识图谱中的实体
+
+重要：查询的字符串描述应该尽量准确，使用"动态规划，一种用于求解复杂问题的算法思想"比直接查询"动态规划"效果更好
+
+核心用途：
+- 当你需要知道某个概念的精准 entity_id 时，使用此工具
+- 输入描述文本，返回匹配度最高的实体列表，每个包含精准 entity_id
+- 后续查询可使用返回的 entity_id 进行精确查询
 
 输入参数:
-- entity_query: string (必需) - 实体查询字符串，可以是实体名称或描述，例如："Splay"、"最短路算法"
-- top_k: integer (可选) - 返回的最相似实体数量，范围 1-30，超出范围将自动调整为安全值
+- entity_query: string (必需) - 实体描述文本，可以是名称或描述，例如："Splay"、"平衡二叉查找树"
+- top_k: integer (可选) - 返回的候选实体数量，范围 1-10，默认5
 - rerank: string (可选) - 重排序策略：
 
   * "pass": 跳过重排，使用原始向量相似度排序（默认）
-    - 优点：速度快，返回结果就是向量相似度排序
+    - 优点：速度快
 
-  * "degree": 基于候选子图度数重排序（推荐用于纠正向量偏差）
+  * "degree": 基于候选子图度数重排序
     - 优点：反映实体在候选子图的重要性
 
-  * "pagerank": 基于全图 PageRank 重排序（推荐用于找重要实体）
+  * "pagerank": 基于全图 PageRank 重排序
     - 优点：反映实体在整个知识图谱中的重要性
 
 返回格式:
 JSON数组，每个元素包含:
 {
   "entity_name": "实体名称",
+  "entity_id": "实体精准ID（包含随机后缀）",
   "description": "实体描述",
   "labels": ["标签1", "标签2", ...],
   "file_path": "源文件路径",
   "created_at": "创建时间",
   // 当rerank="degree"时还会包含:
-  "degree": "在候选子图中的度数（连接数）",
+  "degree": "在候选子图中的度数",
   "similarity_score": "原始向量相似度分数"
   // 当rerank="pagerank"时还会包含:
-  "pagerank": "全图 PageRank 值（重要性）",
+  "pagerank": "全图 PageRank 值",
   "similarity_score": "原始向量相似度分数"
 }
 
 使用示例:
-1. 查找与"神经网络"相似的实体: {"entity_query": "神经网络", "top_k": 10}
-2. 查找"Python"相关的实体: {"entity_query": "Python编程语言"}
-3. 查找"数据库"相关实体: {"entity_query": "数据库管理系统"}
-4. 启用度数重排纠正偏差: {"entity_query": "LCT", "top_k": 30, "rerank": "degree"}
-5. 启用 PageRank 重排找重要实体: {"entity_query": "图算法", "top_k": 20, "rerank": "pagerank"}
+1. 定位"平衡树"相关实体: {"entity_query": "平衡二叉查找树", "top_k": 5}
+2. 查找"Splay"的具体ID: {"entity_query": "Splay树"}
+3. 定位"线段树"概念: {"entity_query": "线段树，区间数据结构"}
+4. 启用度数重排: {"entity_query": "动态规划", "rerank": "degree"}
 
 重排策略选择建议:
 - 一般查询：使用 "pass" 或 "degree"
 - 寻找重要概念：使用 "pagerank"
-- 纠正向量偏差：使用 "degree"
 """
 )
-async def find_similar_entities(
+async def find_entity_by_name(
     entity_query: str,
     top_k: int = 5,
     rerank: str = "pass",
 ) -> List[Dict[str, Any]]:
-    """查找相似的实体"""
+    """根据文本描述定位实体ID"""
     # 安全控制：验证 top_k 参数，防止 DoS 攻击
-    SAFE_DEFAULT_TOP_K = 10
-    MAX_TOP_K = 30
+    SAFE_DEFAULT_TOP_K = 5
+    MAX_TOP_K = 10
 
     if top_k is None or top_k <= 0 or top_k > MAX_TOP_K:
         top_k = SAFE_DEFAULT_TOP_K if top_k is None or top_k <= 0 else MAX_TOP_K
@@ -795,13 +799,13 @@ JSON数组，每行包含查询结果记录
 
 已知两个实体的精确ID，查找它们1-2级邻域中共有的"题目"类型节点：
 {
-  "query": "MATCH path1=(e1 {entity_id: $entity_id1})-[*1..2]-(common) MATCH path2=(e2 {entity_id: $entity_id2})-[*1..2]-(common) WHERE '题目' IN labels(common) AND common <> e1 AND common <> e2 RETURN DISTINCT common.entity_id as entity_name, common.description as description, labels(common) as labels, common.file_path as file_path, length(path1) as dist_from_e1, length(path2) as dist_from_e2 ORDER BY (length(path1) + length(path2)) ASC",
+  "query": "MATCH path1=(e1 {entity_id: $entity_id1})-[:RELATED_TO*1..2]-(common) MATCH path2=(e2 {entity_id: $entity_id2})-[:RELATED_TO*1..2]-(common) WHERE '题目' IN labels(common) AND common <> e1 AND common <> e2 RETURN DISTINCT common.entity_id as entity_name, common.description as description, labels(common) as labels, common.file_path as file_path, length(path1) as dist_from_e1, length(path2) as dist_from_e2 ORDER BY (length(path1) + length(path2)) ASC",
   "parameters": {"entity_id1": "线段树<QyCKb7>", "entity_id2": "树状数组<ABC123>"},
   "vector_params": {"entity_id1": false, "entity_id2": false},
   "limit": 20
 }
 
-注意：使用[*1..2:RELATED_TO]指定关系类型，所有关系类型统一为RELATED_TO
+注意：使用[:RELATED_TO*1..2]指定关系类型，所有关系类型统一为RELATED_TO
 
 ================================================================
 
